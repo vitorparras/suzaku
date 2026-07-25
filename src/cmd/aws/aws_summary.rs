@@ -1,11 +1,13 @@
 use crate::core::color::SuzakuColor::Red;
 use crate::core::log_source::LogSource;
 use crate::core::scan::{get_content, load_json_from_file, process_events_from_dir};
+use crate::core::timeline_writer::resolve_output_targets;
 use crate::core::util::{fatal_error, get_writer, output_path_info, p, sanitize_csv_field};
-use crate::option::cli::InputOption;
+use crate::option::cli::{InputOption, OutputFormat};
 use crate::option::geoip::GeoIPSearch;
 use crate::option::timefiler::filter_by_time;
 use csv::ReaderBuilder;
+use duckdb::Connection;
 use itertools::Itertools;
 use num_format::{Locale, ToFormattedString};
 use serde::Serialize;
@@ -233,7 +235,7 @@ pub fn aws_summary(
     include_sts: &bool,
     hide_descriptions: &bool,
     geo_ip: &Option<PathBuf>,
-    output_type: u8,
+    output_types: &[OutputFormat],
     clobber: bool,
 ) {
     let directory = &input_opt.directory;
@@ -386,7 +388,7 @@ pub fn aws_summary(
             no_color,
             hide_descriptions,
             abused_aws_api_values,
-            output_type,
+            output_types,
             clobber,
         );
     } else if let Some(f) = file {
@@ -400,7 +402,7 @@ pub fn aws_summary(
                 no_color,
                 hide_descriptions,
                 abused_aws_api_values,
-                output_type,
+                output_types,
                 clobber,
             );
         }
@@ -418,7 +420,7 @@ fn output_summary(
     no_color: bool,
     hide_descriptions: &bool,
     abused_aws_api_disc: Vec<String>,
-    output_type: u8,
+    output_types: &[OutputFormat],
     clobber: bool,
 ) {
     if user_data.is_empty() {
@@ -426,30 +428,24 @@ fn output_summary(
         return;
     }
 
-    let output_csv = matches!(output_type, 1 | 4 | 5);
-    let output_json = matches!(output_type, 2 | 4);
-    let output_jsonl = matches!(output_type, 3 | 5);
-
-    let csv_path = output_csv.then(|| {
-        let mut path = output.to_path_buf();
-        path.set_extension("csv");
-        path
-    });
-    let json_path = output_json.then(|| {
-        let mut path = output.to_path_buf();
-        path.set_extension("json");
-        path
-    });
-    let jsonl_path = output_jsonl.then(|| {
-        let mut path = output.to_path_buf();
-        path.set_extension("jsonl");
-        path
-    });
+    // One <base>.<ext> per requested format, deduped — the same resolution the
+    // timeline commands use, so -o/-t behave identically across the tool.
+    let targets = resolve_output_targets(output, output_types);
+    let path_for = |format: OutputFormat| -> Option<PathBuf> {
+        targets
+            .iter()
+            .find(|(fmt, _)| *fmt == format)
+            .map(|(_, path)| path.clone())
+    };
+    let csv_path = path_for(OutputFormat::Csv);
+    let json_path = path_for(OutputFormat::Json);
+    let jsonl_path = path_for(OutputFormat::Jsonl);
+    let duckdb_path = path_for(OutputFormat::Duckdb);
 
     if !clobber
-        && let Some(path) = [csv_path.as_ref(), json_path.as_ref(), jsonl_path.as_ref()]
-            .into_iter()
-            .flatten()
+        && let Some(path) = targets
+            .iter()
+            .map(|(_, path)| path)
             .find(|path| path.exists())
     {
         p(
@@ -613,7 +609,142 @@ fn output_summary(
         output_paths.push(jsonl_path);
     }
 
+    // --- DuckDB 出力 ---
+    if let Some(duckdb_path) = duckdb_path {
+        let records = build_json_records(user_data, *hide_descriptions);
+        match write_duckdb_summary(&duckdb_path, &records) {
+            Ok(()) => output_paths.push(duckdb_path),
+            Err(e) => fatal_error(no_color, &e),
+        }
+    }
+
     output_path_info(no_color, output_paths.as_slice(), true);
+}
+
+/// Write the summary to a DuckDB database as three related tables.
+///
+/// The CSV output folds each user's API calls, regions, IPs, keys and agents
+/// into multi-line text blobs, which is right for a spreadsheet and useless in
+/// SQL. A database output only earns its place if the data is queryable, so the
+/// nested structure of the JSON records is kept as relations instead:
+///
+///   summary             one row per principal
+///   summary_api_calls   one row per (principal, API), tagged with its category
+///   summary_attributes  one row per (principal, attribute value)
+///
+/// so questions the CSV cannot answer — which principals share an access key,
+/// which source IPs called a given abused API — are ordinary joins.
+///
+/// Counts are stored as BIGINT. Timestamps stay VARCHAR in Suzaku's rendered
+/// `YYYY-MM-DD HH:MM:SS` form: it sorts correctly as text and can be CAST when
+/// wanted, which avoids failing the whole write on one unparseable value.
+fn write_duckdb_summary(path: &Path, records: &[SummaryJsonRecord]) -> Result<(), String> {
+    let conn = Connection::open(path)
+        .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
+    conn.execute_batch(
+        "CREATE OR REPLACE TABLE summary (
+             UserARN VARCHAR,
+             NumOfEvents BIGINT,
+             FirstTimestamp VARCHAR,
+             LastTimestamp VARCHAR,
+             UserTypes VARCHAR
+         );
+         CREATE OR REPLACE TABLE summary_api_calls (
+             UserARN VARCHAR,
+             Category VARCHAR,
+             API VARCHAR,
+             Description VARCHAR,
+             Count BIGINT,
+             FirstSeen VARCHAR,
+             LastSeen VARCHAR
+         );
+         CREATE OR REPLACE TABLE summary_attributes (
+             UserARN VARCHAR,
+             Attribute VARCHAR,
+             Value VARCHAR,
+             Count BIGINT,
+             FirstSeen VARCHAR,
+             LastSeen VARCHAR
+         );",
+    )
+    .map_err(|e| format!("Cannot create DuckDB tables in {}: {e}", path.display()))?;
+
+    let mut summary_app = conn
+        .appender("summary")
+        .map_err(|e| format!("Cannot write summary rows to {}: {e}", path.display()))?;
+    for record in records {
+        summary_app
+            .append_row(duckdb::params![
+                record.user_arn,
+                record.num_of_events as i64,
+                record.first_timestamp,
+                record.last_timestamp,
+                record.user_types,
+            ])
+            .map_err(|e| format!("Cannot write summary rows to {}: {e}", path.display()))?;
+    }
+    summary_app
+        .flush()
+        .map_err(|e| format!("Cannot write summary rows to {}: {e}", path.display()))?;
+
+    let mut api_app = conn
+        .appender("summary_api_calls")
+        .map_err(|e| format!("Cannot write API rows to {}: {e}", path.display()))?;
+    for record in records {
+        for (category, entries) in [
+            ("abused_success", &record.abused_apis_success),
+            ("abused_failed", &record.abused_apis_failed),
+            ("other_success", &record.other_apis_success),
+            ("other_failed", &record.other_apis_failed),
+        ] {
+            for entry in entries {
+                api_app
+                    .append_row(duckdb::params![
+                        record.user_arn,
+                        category,
+                        entry.api,
+                        entry.description,
+                        entry.count as i64,
+                        entry.first_seen,
+                        entry.last_seen,
+                    ])
+                    .map_err(|e| format!("Cannot write API rows to {}: {e}", path.display()))?;
+            }
+        }
+    }
+    api_app
+        .flush()
+        .map_err(|e| format!("Cannot write API rows to {}: {e}", path.display()))?;
+
+    let mut attr_app = conn
+        .appender("summary_attributes")
+        .map_err(|e| format!("Cannot write attribute rows to {}: {e}", path.display()))?;
+    for record in records {
+        for (attribute, entries) in [
+            ("aws_region", &record.aws_regions),
+            ("src_ip", &record.src_ips),
+            ("access_key_id", &record.user_access_key_ids),
+            ("user_agent", &record.user_agents),
+        ] {
+            for entry in entries {
+                attr_app
+                    .append_row(duckdb::params![
+                        record.user_arn,
+                        attribute,
+                        entry.value,
+                        entry.count as i64,
+                        entry.first_seen,
+                        entry.last_seen,
+                    ])
+                    .map_err(|e| {
+                        format!("Cannot write attribute rows to {}: {e}", path.display())
+                    })?;
+            }
+        }
+    }
+    attr_app
+        .flush()
+        .map_err(|e| format!("Cannot write attribute rows to {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -941,7 +1072,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 1, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Csv],
+            false,
+        );
 
         assert!(tmp.path().join("result.csv").exists());
         assert!(!tmp.path().join("result.json").exists());
@@ -956,7 +1095,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 2, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Json],
+            false,
+        );
 
         assert!(!tmp.path().join("result.csv").exists());
         assert!(tmp.path().join("result.json").exists());
@@ -971,7 +1118,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 3, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Jsonl],
+            false,
+        );
 
         assert!(!tmp.path().join("result.csv").exists());
         assert!(!tmp.path().join("result.json").exists());
@@ -986,7 +1141,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 4, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Csv, OutputFormat::Json],
+            false,
+        );
 
         assert!(tmp.path().join("result.csv").exists());
         assert!(tmp.path().join("result.json").exists());
@@ -1001,7 +1164,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 5, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Csv, OutputFormat::Jsonl],
+            false,
+        );
 
         assert!(tmp.path().join("result.csv").exists());
         assert!(!tmp.path().join("result.json").exists());
@@ -1019,7 +1190,15 @@ mod tests {
             make_test_summary(),
         );
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 2, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Json],
+            false,
+        );
 
         let content = std::fs::read_to_string(tmp.path().join("result.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1038,7 +1217,15 @@ mod tests {
         user_data.insert("arn::a".to_string(), make_test_summary());
         user_data.insert("arn::b".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 3, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Jsonl],
+            false,
+        );
 
         let content = std::fs::read_to_string(tmp.path().join("result.jsonl")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -1060,7 +1247,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 2, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Json],
+            false,
+        );
 
         // 上書きされていないこと
         let content = std::fs::read_to_string(&json_path).unwrap();
@@ -1079,7 +1274,15 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 4, false);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Csv, OutputFormat::Json],
+            false,
+        );
 
         assert_eq!(std::fs::read_to_string(&json_path).unwrap(), "original");
         assert!(!csv_path.exists());
@@ -1096,10 +1299,208 @@ mod tests {
         let mut user_data = HashMap::new();
         user_data.insert("arn::test".to_string(), make_test_summary());
 
-        output_summary(&user_data, &output_path, true, &false, vec![], 2, true);
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Json],
+            true,
+        );
 
         let content = std::fs::read_to_string(&json_path).unwrap();
         assert_ne!(content, "original");
+    }
+
+    /// The relational shape is the point of the DuckDB output: the CSV folds
+    /// each principal's APIs and attributes into multi-line text, which cannot
+    /// be queried. These pin the schema and the row counts against the same
+    /// records the JSON output is built from.
+    #[test]
+    fn duckdb_summary_writes_three_related_tables() {
+        let tmp = TempDir::new().unwrap();
+        let output_path = tmp.path().join("result");
+        let duckdb_path = tmp.path().join("result.duckdb");
+
+        let mut user_data = HashMap::new();
+        user_data.insert("arn::test".to_string(), make_test_summary());
+
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Duckdb],
+            false,
+        );
+
+        assert!(duckdb_path.exists(), "the .duckdb database must be written");
+        let conn = Connection::open(&duckdb_path).unwrap();
+
+        let (arn, events, first, last): (String, i64, String, String) = conn
+            .query_row(
+                "SELECT UserARN, NumOfEvents, FirstTimestamp, LastTimestamp FROM summary",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(arn, "arn::test");
+        assert_eq!(events, user_data["arn::test"].num_of_events as i64);
+        // Timestamps keep Suzaku's rendered form, which sorts correctly as text.
+        assert_eq!(first, "2024-01-01 00:00:00");
+        assert_eq!(last, "2024-01-02 00:00:00");
+
+        // Every API and attribute entry becomes its own row, tagged with the
+        // category/attribute it came from, rather than a text blob.
+        let api_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary_api_calls", [], |r| r.get(0))
+            .unwrap();
+        assert!(api_rows > 0, "API entries must be exploded into rows");
+        let attr_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary_attributes", [], |r| r.get(0))
+            .unwrap();
+        assert!(attr_rows > 0, "attributes must be exploded into rows");
+    }
+
+    #[test]
+    fn duckdb_summary_row_counts_match_the_json_records() {
+        let tmp = TempDir::new().unwrap();
+        let output_path = tmp.path().join("result");
+
+        let mut user_data = HashMap::new();
+        user_data.insert("arn::a".to_string(), make_test_summary());
+        user_data.insert("arn::b".to_string(), make_test_summary());
+
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Duckdb],
+            false,
+        );
+
+        // The two outputs are built from the same records, so a mismatch means
+        // the relational fan-out dropped or duplicated something.
+        let records = build_json_records(&user_data, false);
+        let expected_apis: usize = records
+            .iter()
+            .map(|r| {
+                r.abused_apis_success.len()
+                    + r.abused_apis_failed.len()
+                    + r.other_apis_success.len()
+                    + r.other_apis_failed.len()
+            })
+            .sum();
+        let expected_attrs: usize = records
+            .iter()
+            .map(|r| {
+                r.aws_regions.len()
+                    + r.src_ips.len()
+                    + r.user_access_key_ids.len()
+                    + r.user_agents.len()
+            })
+            .sum();
+
+        let conn = Connection::open(tmp.path().join("result.duckdb")).unwrap();
+        let summary_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary", [], |r| r.get(0))
+            .unwrap();
+        let api_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary_api_calls", [], |r| r.get(0))
+            .unwrap();
+        let attr_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary_attributes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(summary_rows, records.len() as i64);
+        assert_eq!(api_rows, expected_apis as i64);
+        assert_eq!(attr_rows, expected_attrs as i64);
+    }
+
+    #[test]
+    fn duckdb_summary_categories_are_labelled() {
+        let tmp = TempDir::new().unwrap();
+        let output_path = tmp.path().join("result");
+
+        let mut user_data = HashMap::new();
+        user_data.insert("arn::test".to_string(), make_test_summary());
+
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Duckdb],
+            false,
+        );
+
+        let conn = Connection::open(tmp.path().join("result.duckdb")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT Category FROM summary_api_calls ORDER BY 1")
+            .unwrap();
+        let categories: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for category in &categories {
+            assert!(
+                [
+                    "abused_success",
+                    "abused_failed",
+                    "other_success",
+                    "other_failed"
+                ]
+                .contains(&category.as_str()),
+                "unexpected category label: {category}"
+            );
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT Attribute FROM summary_attributes ORDER BY 1")
+            .unwrap();
+        let attributes: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for attribute in &attributes {
+            assert!(
+                ["aws_region", "src_ip", "access_key_id", "user_agent"]
+                    .contains(&attribute.as_str()),
+                "unexpected attribute label: {attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn duckdb_summary_can_be_written_alongside_csv_and_json() {
+        let tmp = TempDir::new().unwrap();
+        let output_path = tmp.path().join("result");
+
+        let mut user_data = HashMap::new();
+        user_data.insert("arn::test".to_string(), make_test_summary());
+
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Csv, OutputFormat::Json, OutputFormat::Duckdb],
+            false,
+        );
+
+        for extension in ["csv", "json", "duckdb"] {
+            assert!(
+                tmp.path().join(format!("result.{extension}")).exists(),
+                "missing .{extension} output"
+            );
+        }
     }
 
     #[test]

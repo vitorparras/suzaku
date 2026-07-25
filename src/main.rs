@@ -213,7 +213,7 @@ fn main() {
             hide_descriptions,
             geo_ip,
             common_opt,
-            output_type,
+            output_types,
             clobber,
         } => {
             display_logo(common_opt.quiet, no_color, true, false);
@@ -227,7 +227,7 @@ fn main() {
                 include_sts,
                 hide_descriptions,
                 geo_ip,
-                *output_type,
+                output_types,
                 *clobber,
             );
         }

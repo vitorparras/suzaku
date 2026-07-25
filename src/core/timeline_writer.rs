@@ -771,8 +771,9 @@ fn output_format_ext(fmt: OutputFormat) -> &'static str {
 
 /// Resolve the concrete `(format, path)` targets for a base `-o` path: each requested format maps
 /// to `<base>.<ext>` (the base's extension normalized per format), with duplicate formats removed.
-/// Single source of truth for both opening the writers and the `--clobber` preflight.
-fn resolve_output_targets(
+/// Single source of truth for opening the writers, the `--clobber` preflight, and the summary
+/// command, which writes its own files but must resolve `-o`/`-t` identically.
+pub fn resolve_output_targets(
     output_path: &Path,
     output_types: &[OutputFormat],
 ) -> Vec<(OutputFormat, PathBuf)> {

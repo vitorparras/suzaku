@@ -287,9 +287,10 @@ pub enum Commands {
         #[arg(help_heading = Some("Output"), short, long, value_name = "FILE", required = true, display_order = 303)]
         output: PathBuf,
 
-        /// Output type 1: CSV (default), 2: JSON, 3: JSONL, 4: CSV & JSON, 5: CSV & JSONL
-        #[arg(help_heading = Some("Output"), short = 't', long = "output-type", value_parser = clap::value_parser!(u8).range(1..=5), default_value = "1", display_order = 304)]
-        output_type: u8,
+        /// Output format(s): csv (default), json, jsonl, duckdb. Comma-separate or repeat
+        /// to write several at once, e.g. -t csv,duckdb
+        #[arg(help_heading = Some("Output"), short = 't', long = "output-type", value_enum, value_delimiter = ',', default_value = "csv", value_name = "FORMAT,...", display_order = 304)]
+        output_types: Vec<OutputFormat>,
 
         /// Hide description of the commonly abused API calls
         #[arg(help_heading = Some("Output"), short = 'D', long = "hide-descriptions", display_order = 301)]
