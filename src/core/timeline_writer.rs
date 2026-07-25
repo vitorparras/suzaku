@@ -5,7 +5,7 @@ use crate::option::cli::OutputFormat;
 use crate::option::geoip::GeoIPSearch;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use csv::Writer;
-use duckdb::{Connection, params_from_iter};
+use duckdb::{Connection, ToSql};
 use itertools::Itertools;
 use serde_json::Value;
 use sigma_rust::{Event, Rule, SigmaCorrelationRule, TimestampedEvent};
@@ -57,12 +57,24 @@ pub struct Writers {
     std: Option<BufferWriter>,
 }
 
+/// How many rows are buffered before being handed to a DuckDB `Appender` in one go. Large enough
+/// that the per-batch appender setup disappears into the noise, small enough that peak memory
+/// stays bounded on huge scans.
+const DUCKDB_BATCH_ROWS: usize = 10_000;
+
 /// DuckDB output sink: a `.duckdb` database file with a single `timeline` table whose columns
 /// are the output-profile headers (all `VARCHAR`, since every Suzaku value is a string). Unlike
 /// the CSV/JSON sinks this is not a byte stream, so it lives outside the `dyn Write` writers.
+///
+/// Rows are buffered and written through DuckDB's `Appender` in batches. A per-row
+/// `INSERT INTO ... VALUES` re-parses and re-plans the statement and commits its own transaction
+/// every time, which made `-t duckdb` roughly 200x slower per row than the appender path (and the
+/// whole command ~10x slower than `-t csv`). `aws-ct-summary` already writes through an appender;
+/// this brings the timeline output in line.
 struct DuckDbSink {
     conn: Connection,
-    insert_sql: String,
+    /// Rows accumulated since the last flush, drained into an `Appender` by [`Self::flush`].
+    pending: Vec<Vec<String>>,
 }
 
 impl DuckDbSink {
@@ -78,19 +90,44 @@ impl DuckDbSink {
         // matching the truncate-on-write behavior of the CSV/JSON file writers.
         conn.execute_batch(&format!("CREATE OR REPLACE TABLE timeline ({cols_ddl});"))
             .map_err(|e| format!("Cannot create DuckDB table in {}: {e}", path.display()))?;
-        let placeholders = vec!["?"; columns.len()].join(", ");
         Ok(Self {
             conn,
-            insert_sql: format!("INSERT INTO timeline VALUES ({placeholders})"),
+            pending: Vec::with_capacity(DUCKDB_BATCH_ROWS),
         })
     }
 
-    fn append_row(&self, record: &[String]) {
-        // Errors on a single row shouldn't abort the whole scan; drop the row (rare — schema is
-        // fixed and every value is a string).
-        let _ = self
-            .conn
-            .execute(&self.insert_sql, params_from_iter(record.iter()));
+    fn append_row(&mut self, record: &[String]) {
+        self.pending.push(record.to_vec());
+        if self.pending.len() >= DUCKDB_BATCH_ROWS {
+            self.flush();
+        }
+    }
+
+    /// Write the buffered rows and clear the buffer. The appender is created per batch rather than
+    /// held in the struct because `Connection::appender` borrows the connection, which a
+    /// self-referential field cannot express; recreating it costs ~1% of the batch write.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        // Errors shouldn't abort the whole scan; drop the batch (rare — the schema is fixed and
+        // every value is a string).
+        if let Ok(mut appender) = self.conn.appender("timeline") {
+            for row in &self.pending {
+                let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
+                let _ = appender.append_row(params.as_slice());
+            }
+            let _ = appender.flush();
+        }
+        self.pending.clear();
+    }
+}
+
+impl Drop for DuckDbSink {
+    fn drop(&mut self) {
+        // Safety net so buffered rows are never lost if the sink is dropped without an explicit
+        // flush (e.g. an early return on error).
+        self.flush();
     }
 }
 
@@ -209,7 +246,7 @@ fn write_to_csv(record: &[String], context: &mut OutputContext) {
 }
 
 fn write_to_duckdb(record: &[String], context: &mut OutputContext) {
-    if let Some(sink) = &context.writers.duckdb {
+    if let Some(sink) = &mut context.writers.duckdb {
         sink.append_row(record);
     }
 }
@@ -730,6 +767,9 @@ impl<'a> OutputContext<'a> {
         if let Some(ref mut writer) = self.writers.jsonl {
             writer.flush().unwrap();
         }
+        if let Some(ref mut sink) = self.writers.duckdb {
+            sink.flush();
+        }
         if !self.has_written {
             self.writers.csv = None;
             self.writers.json = None;
@@ -1126,7 +1166,7 @@ mod tests {
             "RuleTitle".to_string(),
             "AWS-Region".to_string(),
         ];
-        let sink = DuckDbSink::new(&path, &cols).unwrap();
+        let mut sink = DuckDbSink::new(&path, &cols).unwrap();
         sink.append_row(&[
             "2024-01-01".to_string(),
             "Rule A".to_string(),
@@ -1137,7 +1177,9 @@ mod tests {
             "Rule B".to_string(),
             "ap-northeast-1".to_string(),
         ]);
-        drop(sink); // close the writer connection before re-opening for verification
+        // Fewer rows than DUCKDB_BATCH_ROWS, so these are still buffered: dropping the sink must
+        // flush them. Dropping also closes the writer connection before re-opening to verify.
+        drop(sink);
 
         let conn = Connection::open(&path).unwrap();
         let rows: i64 = conn
@@ -1152,6 +1194,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(title, "Rule B");
+    }
+
+    /// Rows are buffered and written per batch, so every row must survive both an automatic
+    /// mid-scan flush at the batch boundary and the final flush of the partial batch.
+    #[test]
+    fn duckdb_sink_writes_every_row_across_batch_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let cols = vec!["Timestamp".to_string(), "RuleTitle".to_string()];
+        let rows = DUCKDB_BATCH_ROWS + 7;
+
+        let mut sink = DuckDbSink::new(&path, &cols).unwrap();
+        for i in 0..rows {
+            sink.append_row(&[format!("2024-01-01T00:00:{i}"), format!("Rule {i}")]);
+        }
+        sink.flush();
+        drop(sink);
+
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM timeline", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count as usize, rows);
+        // Spot-check a row from the first (auto-flushed) batch and the last (partial) one.
+        for i in [0, DUCKDB_BATCH_ROWS - 1, rows - 1] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM timeline WHERE RuleTitle = ?",
+                    [format!("Rule {i}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "row {i} must be present exactly once");
+        }
     }
 
     #[test]
