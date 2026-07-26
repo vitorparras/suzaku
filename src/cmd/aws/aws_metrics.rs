@@ -274,7 +274,7 @@ fn output_metrics(
     no_color: bool,
 ) {
     if metrics.is_empty() {
-        error_msg(no_color, "No events found.");
+        error_msg(no_color, "No results found.");
         return;
     }
 
