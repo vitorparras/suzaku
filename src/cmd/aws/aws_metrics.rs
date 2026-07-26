@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// keeps every field's total equal to the number of events scanned, so the percentages mean
 /// "share of all events" rather than "share of the events that happened to have this field".
 /// This matches how `aws-ct-summary` renders a missing field.
-const NO_VALUE: &str = "-";
+const NO_VALUE: &str = "";
 
 /// Prefix of AWS STS temporary access key IDs (as opposed to `AKIA` long-term keys).
 const STS_KEY_PREFIX: &str = "ASIA";
