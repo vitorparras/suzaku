@@ -1,4 +1,5 @@
-use crate::core::color::SuzakuColor::{Green, Orange, Red};
+use crate::core::color::SuzakuColor::{Green, Orange};
+use crate::core::errorlog::{log_error, log_warn};
 use crate::core::log_source::{LogSource, is_match_service};
 use crate::core::summary::DetectionSummary;
 use crate::core::timeline_writer::{OutputContext, write_record};
@@ -93,11 +94,7 @@ pub fn scan_directory<'a>(
         log,
         &options.input_opt.file_date_opt,
     ) {
-        p(
-            Red.rdg(no_color),
-            &format!("Failed to scan directory {}: {e}", d.display()),
-            true,
-        );
+        log_error(&format!("Failed to scan directory {}: {e}", d.display()));
     }
 }
 
@@ -179,9 +176,14 @@ where
             pb.set_message(pb_msg);
         }
         if path_str.ends_with("parquet") {
-            if let Ok(events) = load_parquet_events(&path) {
-                let events = normalize_events(events, log);
-                process_events(&events);
+            // Warn rather than silently skipping, matching the json/gz branches below,
+            // so an unreadable or over-cap Parquet file does not overstate coverage.
+            match load_parquet_events(&path) {
+                Ok(events) => {
+                    let events = normalize_events(events, log);
+                    process_events(&events);
+                }
+                Err(e) => log_warn(&format!("Skipping {path_str}: {e}")),
             }
             if show_progress {
                 pb.inc(1);
@@ -194,7 +196,13 @@ where
         {
             match fs::read_to_string(&path) {
                 Ok(contents) => contents,
-                Err(_) => {
+                Err(e) => {
+                    // The file was counted but could not be read (permissions,
+                    // non-UTF-8 content, removed mid-scan). Warn instead of
+                    // silently skipping, so the run's coverage is not overstated.
+                    // The message goes to the error log, not the terminal, so it
+                    // cannot corrupt the progress bar redraw.
+                    log_warn(&format!("Skipping {path_str}: {e}"));
                     if show_progress {
                         pb.inc(1);
                     }
@@ -204,7 +212,8 @@ where
         } else if path_str.ends_with("gz") {
             match read_gz_file(&path) {
                 Ok(contents) => contents,
-                Err(_) => {
+                Err(e) => {
+                    log_warn(&format!("Skipping {path_str}: {e}"));
                     if show_progress {
                         pb.inc(1);
                     }
@@ -657,14 +666,14 @@ fn read_gz_file_capped(file_path: &PathBuf, max_bytes: u64) -> io::Result<String
     let mut buf = Vec::new();
     decoder.take(max_bytes + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > max_bytes {
-        eprintln!(
-            "[WARNING] Skipping {}: decompressed size exceeds the {} GiB limit (possible gzip bomb).",
-            file_path.display(),
-            max_bytes / (1024 * 1024 * 1024)
-        );
+        // The descriptive message is carried in the error so the caller's
+        // single "[WARNING] Skipping <file>: <err>" line reports the reason.
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "decompressed size exceeds the maximum allowed limit",
+            format!(
+                "decompressed size exceeds the {} GiB limit (possible gzip bomb)",
+                max_bytes / (1024 * 1024 * 1024)
+            ),
         ));
     }
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -745,12 +754,13 @@ fn load_parquet_events_capped(
         writer.finish()?;
         decoded_bytes += buf.len() as u64;
         if decoded_bytes > max_bytes {
-            eprintln!(
-                "[WARNING] Skipping {}: decoded size exceeds the {} GiB limit (possible parquet bomb).",
-                file_path.display(),
+            // The descriptive message is carried in the error so the caller's
+            // single "Skipping <file>: <err>" line reports the reason.
+            return Err(format!(
+                "decoded size exceeds the {} GiB limit (possible parquet bomb)",
                 max_bytes / (1024 * 1024 * 1024)
-            );
-            return Err("decoded size exceeds the maximum allowed limit".into());
+            )
+            .into());
         }
         if buf.is_empty() {
             continue;
@@ -820,13 +830,18 @@ pub fn load_json_from_file(
 
 pub fn get_content(f: &PathBuf) -> String {
     let path = f.display().to_string();
-    if path.ends_with(".json") || path.ends_with(".jsonl") || path.ends_with(".csv") {
-        fs::read_to_string(f).unwrap_or_default()
+    let result = if path.ends_with(".json") || path.ends_with(".jsonl") || path.ends_with(".csv") {
+        fs::read_to_string(f)
     } else if path.ends_with(".gz") {
-        read_gz_file(f).unwrap_or_default()
+        read_gz_file(f)
     } else {
-        "".to_string()
-    }
+        return "".to_string();
+    };
+    // Warn instead of silently returning empty content on a read failure.
+    result.unwrap_or_else(|e| {
+        log_warn(&format!("Skipping {path}: {e}"));
+        String::new()
+    })
 }
 
 #[cfg(test)]

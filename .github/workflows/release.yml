@@ -15,6 +15,7 @@ jobs:
   upload:
     runs-on: ${{ matrix.info.os }}
     strategy:
+      fail-fast: false
       matrix:
         info:
           - {
@@ -75,22 +76,36 @@ jobs:
         if: matrix.info.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install gcc-aarch64-linux-gnu
+          sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           cat << EOF >> ./.cargo/config.toml
-          
+
           [target.aarch64-unknown-linux-gnu]
           linker = "aarch64-linux-gnu-gcc"
           EOF
 
-      - name: Install x86_64-unknown-linux-musl
+      # DuckDB's `bundled` feature compiles a C++ source tree, which needs a
+      # musl C++ compiler. Ubuntu's `musl-tools` package only ships `musl-gcc`
+      # (C), so we build inside cross-rs's musl Docker image, which bundles a
+      # full musl gcc/g++ toolchain, instead of plain `cargo build`.
+      - name: Install cross
         if: matrix.info.target == 'x86_64-unknown-linux-musl'
         run: |
-          sudo apt-get update
-          sudo apt-get install musl-tools
+          curl -sSfL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz -o cross.tar.gz
+          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  cross.tar.gz" | shasum -a 256 -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf cross.tar.gz -C "$HOME/.local/bin" cross
+          rm cross.tar.gz
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build Suzaku binary
+        if: matrix.info.target != 'x86_64-unknown-linux-musl'
         run: |
           cargo build --release --target ${{ matrix.info.target }}
+
+      - name: Build Suzaku binary (musl, via cross)
+        if: matrix.info.target == 'x86_64-unknown-linux-musl'
+        run: |
+          cross build --release --target ${{ matrix.info.target }}
 
       - name: Package and Zip - Windows
         if: contains(matrix.info.os, 'windows') == true

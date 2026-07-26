@@ -1,5 +1,5 @@
 use crate::core::rules::load_rules_from_dir;
-use crate::core::util::p;
+use crate::core::util::{error_msg, p};
 use git2::{ErrorCode, Repository};
 use hashbrown::{HashMap, HashSet};
 use serde_json::Value;
@@ -15,7 +15,7 @@ pub fn start_update_rules(no_color: bool) {
     let latest_version_data = get_latest_suzaku_version().unwrap_or_default();
     let now_version = &format!("v{}", env!("CARGO_PKG_VERSION"));
 
-    match update_rules() {
+    match update_rules(no_color) {
         Ok(output) => {
             if output != "You currently have the latest rules." {
                 p(Orange.rdg(no_color), "Rules updated successfully.", true);
@@ -23,9 +23,9 @@ pub fn start_update_rules(no_color: bool) {
         }
         Err(e) => {
             if e.message().is_empty() {
-                p(None, "Failed to update rules.", true);
+                error_msg(no_color, "Failed to update rules.");
             } else {
-                p(None, &format!("Failed to update rules. {e:?}  "), true);
+                error_msg(no_color, &format!("Failed to update rules. {e:?}  "));
             }
         }
     }
@@ -80,7 +80,7 @@ fn get_latest_suzaku_version() -> Result<Option<String>, Box<dyn std::error::Err
 }
 
 /// update rules(suzaku-rules subrepository)
-pub fn update_rules() -> Result<String, git2::Error> {
+pub fn update_rules(no_color: bool) -> Result<String, git2::Error> {
     let mut result;
     let mut prev_modified_rules: HashSet<String> = HashSet::default();
     let suzaku_repo = Repository::open(Path::new("../.."));
@@ -94,13 +94,13 @@ pub fn update_rules() -> Result<String, git2::Error> {
             true,
         );
         // execution git clone of suzaku-rules repository when failed open suzaku repository.
-        result = clone_rules(rule_path);
+        result = clone_rules(rule_path, no_color);
     } else if suzaku_rule_repo.is_ok() {
         // case of exist suzaku-rules repository
         _repo_main_reset_hard(suzaku_rule_repo.as_ref().unwrap())?;
         // case of failed fetching origin/main, git clone is not executed so network error has occurred possibly.
         prev_modified_rules = get_updated_rules(&rule_path.to_path_buf());
-        result = pull_repository(&suzaku_rule_repo.unwrap());
+        result = pull_repository(&suzaku_rule_repo.unwrap(), no_color);
     } else {
         // case of no exist suzaku-rules repository in rules.
         // execute update because submodule information exists if suzaku repository exists submodule information.
@@ -117,8 +117,8 @@ pub fn update_rules() -> Result<String, git2::Error> {
         for mut submodule in submodules {
             submodule.update(true, None)?;
             let submodule_repo = submodule.open()?;
-            if let Err(e) = pull_repository(&submodule_repo) {
-                p(None, &format!("[Alert]Failed submodule update. {e}"), true);
+            if let Err(e) = pull_repository(&submodule_repo, no_color) {
+                error_msg(no_color, &format!("[Alert]Failed submodule update. {e}"));
                 is_success_submodule_update = false;
             }
         }
@@ -149,18 +149,14 @@ fn _repo_main_reset_hard(input_repo: &Repository) -> Result<(), git2::Error> {
 }
 
 /// Pull(fetch and fast-forward merge) repository to input_repo.
-fn pull_repository(input_repo: &Repository) -> Result<String, git2::Error> {
+fn pull_repository(input_repo: &Repository, no_color: bool) -> Result<String, git2::Error> {
     match input_repo
         .find_remote("origin")?
         .fetch(&["main"], None, None)
     {
         Ok(it) => it,
         Err(e) => {
-            p(
-                None,
-                &format!("Failed git fetch to rules folder. {e}"),
-                true,
-            );
+            error_msg(no_color, &format!("Failed git fetch to rules folder. {e}"));
             return Err(git2::Error::from_str(&String::default()));
         }
     };
@@ -176,10 +172,9 @@ fn pull_repository(input_repo: &Repository) -> Result<String, git2::Error> {
         input_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         Ok("Finished fast forward merge.".to_string())
     } else if analysis.0.is_normal() {
-        p(
-            None,
+        error_msg(
+            no_color,
             "update-rules option is git Fast-Forward merge only. please check your rules folder.",
-            true,
         );
         Err(git2::Error::from_str(&String::default()))
     } else {
@@ -188,7 +183,7 @@ fn pull_repository(input_repo: &Repository) -> Result<String, git2::Error> {
 }
 
 /// git clone でhauyabusa-rules レポジトリをrulesフォルダにgit cloneする関数
-fn clone_rules(rules_path: &Path) -> Result<String, git2::Error> {
+fn clone_rules(rules_path: &Path, no_color: bool) -> Result<String, git2::Error> {
     match Repository::clone(
         "https://github.com/Yamato-Security/suzaku-rules.git",
         rules_path,
@@ -199,16 +194,14 @@ fn clone_rules(rules_path: &Path) -> Result<String, git2::Error> {
         }
         Err(e) => {
             if e.code() == ErrorCode::Exists {
-                p(
-                    None,
+                error_msg(
+                    no_color,
                     "You need to update the rules as the user that you downloaded suzaku with.\n        You can also move or delete the current rules folder to sync to the latest rules.",
-                    true,
                 );
             } else {
-                p(
-                    None,
+                error_msg(
+                    no_color,
                     "Failed to git clone into the rules folder. Please rename your rules folder name.",
-                    true,
                 );
             }
             Err(e)

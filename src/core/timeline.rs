@@ -1,4 +1,5 @@
 use crate::core::color::SuzakuColor::{Green, Red};
+use crate::core::errorlog::log_error;
 use crate::core::log_source::LogSource;
 use crate::core::rules;
 use crate::core::scan::{append_summary_data, scan_directory, scan_file};
@@ -116,7 +117,8 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
 
     let (writers, output_pathes) = init_writers(
         options.output_opt.output.as_ref(),
-        options.output_opt.output_type,
+        &options.output_opt.output_types,
+        &profile,
     )
     .unwrap_or_else(|e| fatal_error(no_color, &e));
     let config = OutputConfig::new(no_color, options.output_opt.raw_output, options.localtime);
@@ -248,11 +250,7 @@ fn process_correlation_events(
             }
         }
         Err(e) => {
-            p(
-                Red.rdg(context.config.no_color),
-                &format!("Error processing correlation events: {e}"),
-                true,
-            );
+            log_error(&format!("Error processing correlation events: {e}"));
             return true;
         }
     }

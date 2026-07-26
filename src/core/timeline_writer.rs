@@ -1,15 +1,17 @@
 use crate::core::color::SuzakuColor;
 use crate::core::color::SuzakuColor::{Green, Orange, Red, White, Yellow};
 use crate::core::util::{get_json_writer, get_writer, sanitize_csv_field};
+use crate::option::cli::OutputFormat;
 use crate::option::geoip::GeoIPSearch;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use csv::Writer;
+use duckdb::{Connection, ToSql};
 use itertools::Itertools;
 use serde_json::Value;
 use sigma_rust::{Event, Rule, SigmaCorrelationRule, TimestampedEvent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use termcolor::{BufferWriter, ColorChoice, ColorSpec, WriteColor};
 
 #[derive(Debug)]
@@ -51,7 +53,82 @@ pub struct Writers {
     csv: Option<Writer<Box<dyn Write>>>,
     json: Option<BufWriter<Box<dyn Write>>>,
     jsonl: Option<BufWriter<Box<dyn Write>>>,
+    duckdb: Option<DuckDbSink>,
     std: Option<BufferWriter>,
+}
+
+/// How many rows are buffered before being handed to a DuckDB `Appender` in one go. Large enough
+/// that the per-batch appender setup disappears into the noise, small enough that peak memory
+/// stays bounded on huge scans.
+const DUCKDB_BATCH_ROWS: usize = 10_000;
+
+/// DuckDB output sink: a `.duckdb` database file with a single `timeline` table whose columns
+/// are the output-profile headers (all `VARCHAR`, since every Suzaku value is a string). Unlike
+/// the CSV/JSON sinks this is not a byte stream, so it lives outside the `dyn Write` writers.
+///
+/// Rows are buffered and written through DuckDB's `Appender` in batches. A per-row
+/// `INSERT INTO ... VALUES` re-parses and re-plans the statement and commits its own transaction
+/// every time, which made `-t duckdb` roughly 200x slower per row than the appender path (and the
+/// whole command ~10x slower than `-t csv`). `aws-ct-summary` already writes through an appender;
+/// this brings the timeline output in line.
+struct DuckDbSink {
+    conn: Connection,
+    /// Rows accumulated since the last flush, drained into an `Appender` by [`Self::flush`].
+    pending: Vec<Vec<String>>,
+}
+
+impl DuckDbSink {
+    fn new(path: &Path, columns: &[String]) -> Result<Self, String> {
+        let conn = Connection::open(path)
+            .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
+        let cols_ddl = columns
+            .iter()
+            .map(|c| format!("\"{}\" VARCHAR", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // CREATE OR REPLACE so re-running over an existing .duckdb file overwrites the table,
+        // matching the truncate-on-write behavior of the CSV/JSON file writers.
+        conn.execute_batch(&format!("CREATE OR REPLACE TABLE timeline ({cols_ddl});"))
+            .map_err(|e| format!("Cannot create DuckDB table in {}: {e}", path.display()))?;
+        Ok(Self {
+            conn,
+            pending: Vec::with_capacity(DUCKDB_BATCH_ROWS),
+        })
+    }
+
+    fn append_row(&mut self, record: &[String]) {
+        self.pending.push(record.to_vec());
+        if self.pending.len() >= DUCKDB_BATCH_ROWS {
+            self.flush();
+        }
+    }
+
+    /// Write the buffered rows and clear the buffer. The appender is created per batch rather than
+    /// held in the struct because `Connection::appender` borrows the connection, which a
+    /// self-referential field cannot express; recreating it costs ~1% of the batch write.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        // Errors shouldn't abort the whole scan; drop the batch (rare — the schema is fixed and
+        // every value is a string).
+        if let Ok(mut appender) = self.conn.appender("timeline") {
+            for row in &self.pending {
+                let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
+                let _ = appender.append_row(params.as_slice());
+            }
+            let _ = appender.flush();
+        }
+        self.pending.clear();
+    }
+}
+
+impl Drop for DuckDbSink {
+    fn drop(&mut self) {
+        // Safety net so buffered rows are never lost if the sink is dropped without an explicit
+        // flush (e.g. an early return on error).
+        self.flush();
+    }
 }
 
 pub struct OutputContext<'a> {
@@ -66,13 +143,15 @@ pub struct OutputContext<'a> {
 
 pub fn write_record(event: &Event, json: &Value, rule: Option<&Rule>, context: &mut OutputContext) {
     let localtime = context.config.localtime;
+    let src_ip = src_ip_spec(context.profile).to_string();
     let mut record: Vec<String> = context
         .profile
         .iter()
-        .map(|(_k, v)| get_value_from_event(v, event, rule, context.geo, localtime))
+        .map(|(_k, v)| get_value_from_event(v, event, rule, context.geo, localtime, &src_ip))
         .collect();
     write_to_stdout(&mut record, context, json, Some(event), rule);
     write_to_csv(&record, context);
+    write_to_duckdb(&record, context);
     write_to_json(&record, json, Some(event), rule, context);
     write_to_jsonl(&record, json, Some(event), rule, context);
     context.has_written = true;
@@ -86,6 +165,7 @@ pub fn write_correlation_record(
     let mut record: Vec<String> = build_correlation_record(events, rule, context);
     write_to_stdout(&mut record, context, &Value::Null, None, None);
     write_to_csv(&record, context);
+    write_to_duckdb(&record, context);
     write_to_json(&record, &Value::Null, None, None, context);
     write_to_jsonl(&record, &Value::Null, None, None, context);
 }
@@ -126,7 +206,8 @@ fn write_to_stdout(
 
             for (k, v) in sigma_profile {
                 if let (Some(event), rule) = (event, rule) {
-                    let value = get_value_from_event(&v, event, rule, geo, localtime);
+                    let value =
+                        get_value_from_event(&v, event, rule, geo, localtime, src_ip_spec(profile));
                     json_record[k] = Value::String(value.to_string());
                 }
             }
@@ -164,6 +245,12 @@ fn write_to_csv(record: &[String], context: &mut OutputContext) {
     }
 }
 
+fn write_to_duckdb(record: &[String], context: &mut OutputContext) {
+    if let Some(sink) = &mut context.writers.duckdb {
+        sink.append_row(record);
+    }
+}
+
 fn write_to_json_format(
     record: &[String],
     json: &Value,
@@ -195,7 +282,8 @@ fn write_to_json_format(
 
             for (k, v) in sigma_profile {
                 if let (Some(event), rule) = (event, rule) {
-                    let value = get_value_from_event(&v, event, rule, geo, localtime);
+                    let value =
+                        get_value_from_event(&v, event, rule, geo, localtime, src_ip_spec(profile));
                     json_record[k] = Value::String(value.to_string());
                 }
             }
@@ -364,6 +452,7 @@ fn build_correlation_record(
                 rule,
                 context.geo,
                 localtime,
+                src_ip_spec(profile),
             );
             values.insert(value);
         }
@@ -382,28 +471,49 @@ fn build_correlation_record(
         .collect()
 }
 
+/// The `SrcIP` field spec declared by the active output profile — e.g.
+/// `.sourceIPAddress` for AWS, or `.claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress`
+/// for Azure/M365. Empty when the profile has no `SrcIP` column. Used to resolve
+/// the source IP for GeoIP enrichment without hardcoding an AWS-only field name.
+fn src_ip_spec(profile: &[(String, String)]) -> &str {
+    profile
+        .iter()
+        .find(|(k, _)| k == "SrcIP")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
 fn get_value_from_event_common(
     key: &str,
     event: &Event,
     rule_info: RuleInfo,
     geo_ip: &mut Option<GeoIPSearch>,
     localtime: bool,
+    src_ip: &str,
 ) -> String {
-    // GeoIP処理部分（共通）: only the three geo columns are enriched. A missing
-    // GeoIP DB, a missing sourceIPAddress, or a non-IP value (e.g. an AWS service
-    // principal like "cloudtrail.amazonaws.com") yields the "-" placeholder for
-    // those columns only — it must never overwrite an unrelated column's value.
+    // GeoIP処理部分（共通）: only the three geo columns are enriched. The source IP
+    // is resolved from the profile's SrcIP field spec (`.sourceIPAddress` for AWS,
+    // `.callerIpAddress|.ClientIP|...` for Azure/M365) — NOT a hardcoded field name
+    // — so Azure/M365 enrich just like AWS. A missing GeoIP DB, a missing source IP,
+    // or a non-IP value (e.g. a service principal like "cloudtrail.amazonaws.com")
+    // yields the "-" placeholder for those columns only — it must never overwrite
+    // an unrelated column's value.
     if matches!(key, "SrcASN" | "SrcCity" | "SrcCountry") {
-        if let Some(geo) = geo_ip
-            && let Some(ip) = event.get("sourceIPAddress")
-        {
-            let ip = ip.value_to_string();
-            if let Some(ip) = geo.convert(ip.as_str()) {
-                return match key {
-                    "SrcASN" => geo.get_asn(ip),
-                    "SrcCity" => geo.get_city(ip),
-                    _ => geo.get_country(ip),
-                };
+        if let Some(geo) = geo_ip {
+            let ip_value = src_ip
+                .split('|')
+                .map(|k| k.trim_matches('.').trim())
+                .filter(|k| !k.is_empty())
+                .find_map(|k| event.get(k));
+            if let Some(ip) = ip_value {
+                let ip = ip.value_to_string();
+                if let Some(ip) = geo.convert(ip.as_str()) {
+                    return match key {
+                        "SrcASN" => geo.get_asn(ip),
+                        "SrcCity" => geo.get_city(ip),
+                        _ => geo.get_country(ip),
+                    };
+                }
             }
         }
         return "-".to_string();
@@ -548,6 +658,7 @@ fn get_value_from_correlation_event(
     rule: &SigmaCorrelationRule,
     geo_ip: &mut Option<GeoIPSearch>,
     localtime: bool,
+    src_ip: &str,
 ) -> String {
     get_value_from_event_common(
         key,
@@ -555,6 +666,7 @@ fn get_value_from_correlation_event(
         RuleInfo::CorrelationRule(rule),
         geo_ip,
         localtime,
+        src_ip,
     )
 }
 
@@ -564,9 +676,10 @@ fn get_value_from_event(
     rule: Option<&Rule>,
     geo_ip: &mut Option<GeoIPSearch>,
     localtime: bool,
+    src_ip: &str,
 ) -> String {
     if let Some(rule) = rule {
-        get_value_from_event_common(key, event, RuleInfo::Rule(rule), geo_ip, localtime)
+        get_value_from_event_common(key, event, RuleInfo::Rule(rule), geo_ip, localtime, src_ip)
     } else {
         "".to_string()
     }
@@ -589,12 +702,18 @@ impl Writers {
             csv: None,
             json: None,
             jsonl: None,
+            duckdb: None,
             std: None,
         }
     }
 
     pub fn with_csv(mut self, writer: Writer<Box<dyn Write>>) -> Self {
         self.csv = Some(writer);
+        self
+    }
+
+    fn with_duckdb(mut self, sink: DuckDbSink) -> Self {
+        self.duckdb = Some(sink);
         self
     }
 
@@ -648,10 +767,16 @@ impl<'a> OutputContext<'a> {
         if let Some(ref mut writer) = self.writers.jsonl {
             writer.flush().unwrap();
         }
+        if let Some(ref mut sink) = self.writers.duckdb {
+            sink.flush();
+        }
         if !self.has_written {
             self.writers.csv = None;
             self.writers.json = None;
             self.writers.jsonl = None;
+            // Drop the DuckDB sink too: its open connection holds a lock on the `.duckdb` file on
+            // Windows, so `remove_file` below would fail silently and leave an empty database behind.
+            self.writers.duckdb = None;
 
             for path in &self.output_paths {
                 if path.exists() {
@@ -674,67 +799,74 @@ impl<'a> OutputContext<'a> {
     }
 }
 
-#[derive(Debug)]
-pub enum OutputType {
-    Csv,
-    Json,
-    Jsonl,
-    CsvAndJson,
-    CsvAndJsonl,
-}
-
-impl OutputType {
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(OutputType::Csv),
-            2 => Some(OutputType::Json),
-            3 => Some(OutputType::Jsonl),
-            4 => Some(OutputType::CsvAndJson),
-            5 => Some(OutputType::CsvAndJsonl),
-            _ => None,
-        }
+/// File extension written for each output format.
+fn output_format_ext(fmt: OutputFormat) -> &'static str {
+    match fmt {
+        OutputFormat::Csv => "csv",
+        OutputFormat::Json => "json",
+        OutputFormat::Jsonl => "jsonl",
+        OutputFormat::Duckdb => "duckdb",
     }
 }
+
+/// Resolve the concrete `(format, path)` targets for a base `-o` path: each requested format maps
+/// to `<base>.<ext>` (the base's extension normalized per format), with duplicate formats removed.
+/// Single source of truth for opening the writers, the `--clobber` preflight, and the summary
+/// command, which writes its own files but must resolve `-o`/`-t` identically.
+pub fn resolve_output_targets(
+    output_path: &Path,
+    output_types: &[OutputFormat],
+) -> Vec<(OutputFormat, PathBuf)> {
+    let mut seen = HashSet::new();
+    output_types
+        .iter()
+        .copied()
+        .filter(|f| seen.insert(*f))
+        .map(|fmt| {
+            let ext = output_format_ext(fmt);
+            let mut path = output_path.to_path_buf();
+            if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+                path.set_extension(ext);
+            }
+            (fmt, path)
+        })
+        .collect()
+}
+
+/// The concrete output file paths a run would write for `output_types` under a base `-o` path,
+/// e.g. `<base>.csv` / `<base>.duckdb`. Used to preflight `--clobber` against every file that
+/// would actually be created, not just the literal `-o` value.
+pub fn resolve_output_paths(output_path: &Path, output_types: &[OutputFormat]) -> Vec<PathBuf> {
+    resolve_output_targets(output_path, output_types)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Build the output writers for the requested formats. Each format writes to `<output>.<ext>`
+/// (the base path's extension is normalized per format), so a single `-o` base path can fan out
+/// to several files at once. `profile` supplies the column names for the DuckDB table. With no
+/// `output_path`, results go to the stdout table and `output_types` is ignored.
 pub fn init_writers(
     output_path: Option<&PathBuf>,
-    output_type: u8,
+    output_types: &[OutputFormat],
+    profile: &[(String, String)],
 ) -> Result<(Writers, Vec<PathBuf>), String> {
     let mut output_pathes = vec![];
     let mut writers = Writers::new();
 
     if let Some(output_path) = output_path {
-        let output_type = OutputType::from_u8(output_type).unwrap_or(OutputType::Csv);
-
-        match output_type {
-            OutputType::Csv | OutputType::CsvAndJson | OutputType::CsvAndJsonl => {
-                let mut csv_path = output_path.clone();
-                if csv_path.extension().and_then(|ext| ext.to_str()) != Some("csv") {
-                    csv_path.set_extension("csv");
+        for (fmt, path) in resolve_output_targets(output_path, output_types) {
+            output_pathes.push(path.clone());
+            writers = match fmt {
+                OutputFormat::Csv => writers.with_csv(get_writer(&Some(path))?),
+                OutputFormat::Json => writers.with_json(get_json_writer(&Some(path))?),
+                OutputFormat::Jsonl => writers.with_jsonl(get_json_writer(&Some(path))?),
+                OutputFormat::Duckdb => {
+                    let columns: Vec<String> = profile.iter().map(|(k, _)| k.clone()).collect();
+                    writers.with_duckdb(DuckDbSink::new(&path, &columns)?)
                 }
-                output_pathes.push(csv_path.clone());
-                writers = writers.with_csv(get_writer(&Some(csv_path))?);
-            }
-            _ => {}
-        }
-
-        match output_type {
-            OutputType::Json | OutputType::CsvAndJson => {
-                let mut json_path = output_path.clone();
-                if json_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                    json_path.set_extension("json");
-                }
-                output_pathes.push(json_path.clone());
-                writers = writers.with_json(get_json_writer(&Some(json_path))?);
-            }
-            OutputType::Jsonl | OutputType::CsvAndJsonl => {
-                let mut jsonl_path = output_path.clone();
-                if jsonl_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    jsonl_path.set_extension("jsonl");
-                }
-                output_pathes.push(jsonl_path.clone());
-                writers = writers.with_jsonl(get_json_writer(&Some(jsonl_path))?);
-            }
-            _ => {}
+            };
         }
     } else {
         let disp_wtr = BufferWriter::stdout(ColorChoice::Always);
@@ -918,17 +1050,237 @@ mod tests {
 
         // A normal column keeps its own value — it is NOT clobbered by the non-IP source address.
         assert_eq!(
-            get_value_from_event(".eventName", &event, Some(&rule), &mut geo_ip, false),
+            get_value_from_event(
+                ".eventName",
+                &event,
+                Some(&rule),
+                &mut geo_ip,
+                false,
+                ".sourceIPAddress"
+            ),
             "ListBuckets"
         );
         // The GeoIP columns can't be enriched from a non-IP value, so they show the placeholder.
         assert_eq!(
-            get_value_from_event("SrcCountry", &event, Some(&rule), &mut geo_ip, false),
+            get_value_from_event(
+                "SrcCountry",
+                &event,
+                Some(&rule),
+                &mut geo_ip,
+                false,
+                ".sourceIPAddress"
+            ),
             "-"
         );
         assert_eq!(
-            get_value_from_event("SrcASN", &event, Some(&rule), &mut geo_ip, false),
+            get_value_from_event(
+                "SrcASN",
+                &event,
+                Some(&rule),
+                &mut geo_ip,
+                false,
+                ".sourceIPAddress"
+            ),
             "-"
+        );
+    }
+
+    #[test]
+    fn src_ip_spec_reads_profile_srcip_field() {
+        let aws = vec![
+            ("EventName".to_string(), ".eventName".to_string()),
+            ("SrcIP".to_string(), ".sourceIPAddress".to_string()),
+        ];
+        assert_eq!(src_ip_spec(&aws), ".sourceIPAddress");
+        let azure = vec![(
+            "SrcIP".to_string(),
+            ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress".to_string(),
+        )];
+        assert_eq!(
+            src_ip_spec(&azure),
+            ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress"
+        );
+        let no_srcip: Vec<(String, String)> = vec![("X".to_string(), ".y".to_string())];
+        assert_eq!(src_ip_spec(&no_srcip), "");
+    }
+
+    // #159: GeoIP enrichment must resolve the source IP from the profile's SrcIP
+    // spec, so an Azure `callerIpAddress` enriches identically to an AWS
+    // `sourceIPAddress`. Before the fix the Azure field was ignored (the lookup
+    // hardcoded `sourceIPAddress`) and the geo columns were always "-".
+    #[test]
+    fn geoip_resolves_source_ip_via_profile_spec() {
+        use crate::option::geoip::GeoIPSearch;
+        use sigma_rust::{event_from_json, rule_from_yaml};
+        use std::path::Path;
+
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let ip = "8.8.8.8";
+        let aws_event = event_from_json(&format!(
+            r#"{{"sourceIPAddress": "{ip}", "eventName": "E"}}"#
+        ))
+        .unwrap();
+        let azure_event = event_from_json(&format!(
+            r#"{{"callerIpAddress": "{ip}", "eventName": "E"}}"#
+        ))
+        .unwrap();
+
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+        let aws_country = get_value_from_event(
+            "SrcCountry",
+            &aws_event,
+            Some(&rule),
+            &mut geo,
+            false,
+            ".sourceIPAddress",
+        );
+        let azure_country = get_value_from_event(
+            "SrcCountry",
+            &azure_event,
+            Some(&rule),
+            &mut geo,
+            false,
+            ".callerIpAddress",
+        );
+        // Same IP + same DB must enrich identically regardless of the field name.
+        assert_eq!(aws_country, azure_country);
+        // When the DB actually resolves the IP, the Azure field must enrich (not "-").
+        if aws_country != "-" {
+            assert_ne!(azure_country, "-");
+        }
+    }
+
+    #[test]
+    fn duckdb_sink_creates_named_table_and_appends_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        // A column name with a hyphen must be quoted correctly in the DDL.
+        let cols = vec![
+            "Timestamp".to_string(),
+            "RuleTitle".to_string(),
+            "AWS-Region".to_string(),
+        ];
+        let mut sink = DuckDbSink::new(&path, &cols).unwrap();
+        sink.append_row(&[
+            "2024-01-01".to_string(),
+            "Rule A".to_string(),
+            "us-east-1".to_string(),
+        ]);
+        sink.append_row(&[
+            "2024-01-02".to_string(),
+            "Rule B".to_string(),
+            "ap-northeast-1".to_string(),
+        ]);
+        // Fewer rows than DUCKDB_BATCH_ROWS, so these are still buffered: dropping the sink must
+        // flush them. Dropping also closes the writer connection before re-opening to verify.
+        drop(sink);
+
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM timeline", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        let title: String = conn
+            .query_row(
+                "SELECT RuleTitle FROM timeline WHERE \"AWS-Region\" = 'ap-northeast-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Rule B");
+    }
+
+    /// Rows are buffered and written per batch, so every row must survive both an automatic
+    /// mid-scan flush at the batch boundary and the final flush of the partial batch.
+    #[test]
+    fn duckdb_sink_writes_every_row_across_batch_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let cols = vec!["Timestamp".to_string(), "RuleTitle".to_string()];
+        let rows = DUCKDB_BATCH_ROWS + 7;
+
+        let mut sink = DuckDbSink::new(&path, &cols).unwrap();
+        for i in 0..rows {
+            sink.append_row(&[format!("2024-01-01T00:00:{i}"), format!("Rule {i}")]);
+        }
+        sink.flush();
+        drop(sink);
+
+        let conn = Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM timeline", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count as usize, rows);
+        // Spot-check a row from the first (auto-flushed) batch and the last (partial) one.
+        for i in [0, DUCKDB_BATCH_ROWS - 1, rows - 1] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM timeline WHERE RuleTitle = ?",
+                    [format!("Rule {i}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "row {i} must be present exactly once");
+        }
+    }
+
+    #[test]
+    fn resolve_output_paths_expands_base_per_format_and_dedups() {
+        // Each format maps the base to <base>.<ext>, preserving order.
+        assert_eq!(
+            resolve_output_paths(
+                Path::new("result"),
+                &[OutputFormat::Csv, OutputFormat::Duckdb, OutputFormat::Jsonl]
+            ),
+            vec![
+                PathBuf::from("result.csv"),
+                PathBuf::from("result.duckdb"),
+                PathBuf::from("result.jsonl"),
+            ]
+        );
+        // A base that already carries some extension is normalized to the format's extension.
+        assert_eq!(
+            resolve_output_paths(Path::new("out.csv"), &[OutputFormat::Duckdb]),
+            vec![PathBuf::from("out.duckdb")]
+        );
+        // Repeated formats collapse to a single path.
+        assert_eq!(
+            resolve_output_paths(Path::new("result"), &[OutputFormat::Csv, OutputFormat::Csv]),
+            vec![PathBuf::from("result.csv")]
+        );
+    }
+
+    #[test]
+    fn flush_all_drops_duckdb_sink_and_removes_empty_db_on_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let profile = vec![("Timestamp".to_string(), ".eventTime".to_string())];
+        let sink = DuckDbSink::new(&path, &["Timestamp".to_string()]).unwrap();
+        // Opening the sink creates the database file.
+        assert!(path.exists());
+
+        let writers = Writers::new().with_duckdb(sink);
+        let config = OutputConfig::new(true, false, false);
+        let mut geo = None;
+        let output_paths = vec![path.clone()];
+        let mut ctx = OutputContext::new(&profile, &mut geo, &config, writers, &output_paths);
+
+        // Never wrote a record, so flush_all takes the no-hit cleanup path.
+        ctx.flush_all();
+
+        assert!(
+            ctx.writers.duckdb.is_none(),
+            "the DuckDB sink must be dropped so its connection releases the file lock"
+        );
+        assert!(
+            !path.exists(),
+            "the empty .duckdb database must be removed when there are no hits"
         );
     }
 }

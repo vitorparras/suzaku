@@ -36,19 +36,36 @@ pub fn aws_search(options: &SearchOptions, common_opt: &CommonOptions) {
     let profile = load_profile(&LogSource::Aws, &geo_search, true);
     let (writers, output_pathes) = init_writers(
         options.output_opt.output.as_ref(),
-        options.output_opt.output_type,
+        &options.output_opt.output_types,
+        &profile,
     )
     .unwrap_or_else(|e| fatal_error(no_color, &e));
     let config = OutputConfig::new(no_color, options.output_opt.raw_output, false);
     let mut context =
         OutputContext::new(&profile, &mut geo_search, &config, writers, &output_pathes);
 
+    for filter in &options.filter {
+        if !filter.contains(':') {
+            fatal_error(
+                no_color,
+                &format!(
+                    "Invalid --filter '{filter}': expected FIELD:VALUE (e.g. eventName:ConsoleLogin)"
+                ),
+            );
+        }
+    }
     let filter_conditions = parse_filter_conditions(&options.filter);
 
-    let regex_pattern = options
-        .regex
-        .as_ref()
-        .map(|pattern| Regex::new(pattern).expect("Invalid regex pattern"));
+    let regex_pattern = match options.regex.as_ref() {
+        Some(pattern) => match Regex::new(pattern) {
+            Ok(re) => Some(re),
+            Err(e) => fatal_error(
+                no_color,
+                &format!("Invalid --regex pattern '{pattern}': {e}"),
+            ),
+        },
+        None => None,
+    };
 
     let sigma_rule_content = r"title: Dummy rule for Search command
 id: 2a2466e1-c0da-434b-a327-57da46cc8dae
@@ -128,6 +145,11 @@ level: informational";
             search_func(&events);
         }
     }
+
+    // Flush the writers and, when nothing matched, clean up the empty output files (mirrors the
+    // timeline command). Without this, aws-ct-search left a zero-row file behind for every format
+    // even though it reports "Results saved: None".
+    context.flush_all();
 
     display_results(matched_events, total_events, no_color);
     if !output_pathes.is_empty() {

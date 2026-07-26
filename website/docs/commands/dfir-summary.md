@@ -145,22 +145,67 @@ Input:
   -f, --file <FILE>      File path to one gz/json file
 
 Filtering:
+  -s, --include-sts-keys       Include temporary AWS STS access key IDs
       --timeline-start <DATE>  Start time of the events to load (ex: "2022-02-22T23:59:59Z)
       --timeline-end <DATE>    End time of the events to load (ex: "2020-02-22T00:00:00Z")
       --time-offset <OFFSET>   Scan recent events based on an offset (ex: 1y, 3M, 30d, 24h, 30m)
-  -s, --include-sts-keys       Include temporary AWS STS access key IDs
+      --file-date-from <DATE>  Filter files by start date based on AWSLogs S3 path date structure (ex: "20240101")
+      --file-date-to <DATE>    Filter files by end date based on AWSLogs S3 path date structure (ex: "20241231")
 
 Output:
-  -o, --output <FILE>           Output results to a CSV file
-  -D, --hide-descriptions       Hide description of the commonly abused API calls
-  -G, --GeoIP <MAXMIND-DB-DIR>  Add GeoIP (ASN, city, country) info to IP addresses
+  -C, --clobber                   Overwrite files when saving
+  -D, --hide-descriptions         Hide description of the commonly abused API calls
+  -G, --geo-ip <MAXMIND-DB-DIR>   Add GeoIP (ASN, city, country) info to IP addresses [alias: --GeoIP]
+  -o, --output <FILE>             Save the results to a file
+  -t, --output-type <FORMAT,...>  Output format(s): csv (default), json, jsonl, duckdb. Comma-separate or repeat to write several at once, e.g. -t csv,duckdb [default: csv] [possible values: csv, json, jsonl, duckdb]
+
+General Options:
+  -h, --help  Show the help menu
 
 Display Settings:
   -K, --no-color  Disable color output
   -q, --quiet     Quiet mode: do not display the launch banner
+```
 
-General Options:
-  -h, --help  Show the help menu
+### Output formats
+
+`-t, --output-type` takes format **names** and accepts several at once, comma-separated or
+repeated. Each format is written to `<output>.<ext>`, so a single `-o` base path can produce
+more than one file:
+
+```
+./suzaku aws-ct-summary -d ../suzaku-sample-data -o summary -t csv,duckdb
+```
+
+* `csv` (default) — one row per principal, with each principal's API calls and attributes folded
+  into multi-line cells. Best read in Timeline Explorer or Numbers rather than Excel.
+* `json` / `jsonl` — the same data with those cells kept as nested arrays.
+* `duckdb` — a self-contained DuckDB database. Because the CSV's multi-line cells cannot be
+  queried, the nested data is stored **relationally** across three tables:
+
+| Table | One row per | Columns |
+|---|---|---|
+| `summary` | principal | `UserARN`, `NumOfEvents`, `FirstTimestamp`, `LastTimestamp`, `UserTypes` |
+| `summary_api_calls` | principal + API | `UserARN`, `Category`, `API`, `Description`, `Count`, `FirstSeen`, `LastSeen` |
+| `summary_attributes` | principal + value | `UserARN`, `Attribute`, `Value`, `Count`, `FirstSeen`, `LastSeen` |
+
+`Category` is one of `abused_success`, `abused_failed`, `other_success`, `other_failed`.
+`Attribute` is one of `aws_region`, `src_ip`, `access_key_id`, `user_agent`.
+
+Counts are `BIGINT`; timestamps stay `VARCHAR` in Suzaku's rendered `YYYY-MM-DD HH:MM:SS` form,
+which sorts correctly as text and can be `CAST` when you want real timestamps.
+
+This makes questions the CSV cannot answer into ordinary joins — for example, which source IPs
+were used by the principals that called an abused API:
+
+```sql
+SELECT a.API, SUM(a.Count) AS calls, COUNT(DISTINCT t.Value) AS src_ips
+FROM summary_api_calls a
+JOIN summary_attributes t
+  ON t.UserARN = a.UserARN AND t.Attribute = 'src_ip'
+WHERE a.Category LIKE 'abused%'
+GROUP BY a.API
+ORDER BY calls DESC;
 ```
 
 ### `aws-ct-metrics` command example

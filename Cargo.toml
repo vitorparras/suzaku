@@ -44,6 +44,12 @@ sigma-rust = { git = "https://github.com/Yamato-Security/sigma-rust", tag = "v0.
 # flate2-zlib-rs matches the zlib-rs backend used by our own flate2 dependency.
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "snap", "flate2", "flate2-zlib-rs", "zstd", "lz4"] }
 arrow-json = "59.1.0"
+# DuckDB output. `bundled` compiles the DuckDB engine into the binary so releases stay
+# self-contained (no system libduckdb needed), at the cost of build time / binary size.
+# Require >= 1.10504: earlier bundled builds fail on the current Windows CI MSVC toolset
+# (14.51), whose STL removed `stdext::checked_array_iterator` that DuckDB's vendored fmt
+# used; 1.10504 patches that header and links the Restart Manager lib. (duckdb-rs #786)
+duckdb = { version = "1.10504", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies] #Mac and Linux
 openssl = { version = "*", features = ["vendored"] }  #vendored is needed to compile statically.

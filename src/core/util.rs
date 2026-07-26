@@ -1,4 +1,5 @@
 use crate::core::color::SuzakuColor::{Green, Red};
+use crate::core::errorlog::log_error;
 use crate::core::log_source::LogSource;
 use crate::option::geoip::GeoIPSearch;
 use bytesize::ByteSize;
@@ -54,33 +55,59 @@ pub fn sanitize_csv_field(field: &str) -> String {
     }
 }
 
+/// Prints a run-ending error in red. Every message the user sees just before suzaku
+/// gives up — a bad path, an unusable combination of options, a missing rules folder,
+/// a failed rule update — goes through here or `fatal_error`, so they all look the
+/// same instead of some being red and some being the default terminal color, and so
+/// they all honor `--no-color`.
+pub fn error_msg(no_color: bool, msg: &str) {
+    p(Red.rdg(no_color), msg, true);
+}
+
 /// Prints a fatal error in red and exits with a non-zero status, so that
 /// input/filesystem failures end the run with a clean, actionable message
-/// instead of a Rust panic and backtrace.
+/// instead of a Rust panic and backtrace. Unlike ordinary warnings this stays on
+/// the terminal as well as going to the error log: it is the last thing the run
+/// prints, so hiding it in a file would leave the user with a silent exit.
 pub fn fatal_error(no_color: bool, msg: &str) -> ! {
-    p(Red.rdg(no_color), msg, true);
+    log_error(msg);
+    error_msg(no_color, msg);
     std::process::exit(1);
 }
 
-pub fn check_path_exists(filepath: Option<PathBuf>, dirpath: Option<PathBuf>) -> bool {
+pub fn check_path_exists(
+    filepath: Option<PathBuf>,
+    dirpath: Option<PathBuf>,
+    no_color: bool,
+) -> bool {
     if let Some(file) = filepath {
         if !file.exists() {
-            println!("File {file:?} does not exist.");
+            error_msg(no_color, &format!("File {file:?} does not exist."));
             return false;
         }
         if !file.is_file() {
-            println!("Path {file:?} is not a file (it may be a directory or special file type).");
+            error_msg(
+                no_color,
+                &format!(
+                    "Path {file:?} is not a file (it may be a directory or special file type)."
+                ),
+            );
             return false;
         }
     }
 
     if let Some(dir) = dirpath {
         if !dir.exists() {
-            println!("Directory {dir:?} does not exist.");
+            error_msg(no_color, &format!("Directory {dir:?} does not exist."));
             return false;
         }
         if !dir.is_dir() {
-            println!("Path {dir:?} is not a directory (it may be a file or special file type).");
+            error_msg(
+                no_color,
+                &format!(
+                    "Path {dir:?} is not a directory (it may be a file or special file type)."
+                ),
+            );
             return false;
         }
     }
