@@ -1,4 +1,5 @@
-use crate::core::color::SuzakuColor::{Green, Orange, Red};
+use crate::core::color::SuzakuColor::{Green, Orange};
+use crate::core::errorlog::{log_error, log_warn};
 use crate::core::log_source::{LogSource, is_match_service};
 use crate::core::summary::DetectionSummary;
 use crate::core::timeline_writer::{OutputContext, write_record};
@@ -87,11 +88,7 @@ pub fn scan_directory<'a>(
         log,
         &options.input_opt.file_date_opt,
     ) {
-        p(
-            Red.rdg(no_color),
-            &format!("Failed to scan directory {}: {e}", d.display()),
-            true,
-        );
+        log_error(&format!("Failed to scan directory {}: {e}", d.display()));
     }
 }
 
@@ -182,7 +179,9 @@ where
                     // The file was counted but could not be read (permissions,
                     // non-UTF-8 content, removed mid-scan). Warn instead of
                     // silently skipping, so the run's coverage is not overstated.
-                    eprintln!("[WARNING] Skipping {path_str}: {e}");
+                    // The message goes to the error log, not the terminal, so it
+                    // cannot corrupt the progress bar redraw.
+                    log_warn(&format!("Skipping {path_str}: {e}"));
                     if show_progress {
                         pb.inc(1);
                     }
@@ -193,7 +192,7 @@ where
             match read_gz_file(&path) {
                 Ok(contents) => contents,
                 Err(e) => {
-                    eprintln!("[WARNING] Skipping {path_str}: {e}");
+                    log_warn(&format!("Skipping {path_str}: {e}"));
                     if show_progress {
                         pb.inc(1);
                     }
@@ -712,7 +711,7 @@ pub fn get_content(f: &PathBuf) -> String {
     };
     // Warn instead of silently returning empty content on a read failure.
     result.unwrap_or_else(|e| {
-        eprintln!("[WARNING] Skipping {path}: {e}");
+        log_warn(&format!("Skipping {path}: {e}"));
         String::new()
     })
 }

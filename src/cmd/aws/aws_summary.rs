@@ -1,8 +1,11 @@
 use crate::core::color::SuzakuColor::Red;
+use crate::core::errorlog::{log_error, log_warn};
 use crate::core::log_source::LogSource;
 use crate::core::scan::{get_content, load_json_from_file, process_events_from_dir};
 use crate::core::timeline_writer::resolve_output_targets;
-use crate::core::util::{fatal_error, get_writer, output_path_info, p, sanitize_csv_field};
+use crate::core::util::{
+    error_msg, fatal_error, get_writer, output_path_info, p, sanitize_csv_field,
+};
 use crate::option::cli::{InputOption, OutputFormat};
 use crate::option::geoip::GeoIPSearch;
 use crate::option::timefiler::filter_by_time;
@@ -17,7 +20,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use termcolor::Color;
 
 // ---------------------------------------------------------------------------
 // JSON 出力用データ構造
@@ -376,11 +378,7 @@ pub fn aws_summary(
             &LogSource::Aws,
             &input_opt.file_date_opt,
         ) {
-            p(
-                Red.rdg(no_color),
-                &format!("Failed to scan directory {}: {e}", d.display()),
-                true,
-            );
+            log_error(&format!("Failed to scan directory {}: {e}", d.display()));
         }
         output_summary(
             &user_data,
@@ -424,7 +422,7 @@ fn output_summary(
     clobber: bool,
 ) {
     if user_data.is_empty() {
-        p(Some(Color::Rgb(255, 0, 0)), "No events found.", true);
+        error_msg(no_color, "No events found.");
         return;
     }
 
@@ -448,13 +446,12 @@ fn output_summary(
             .map(|(_, path)| path)
             .find(|path| path.exists())
     {
-        p(
-            Some(Color::Rgb(255, 0, 0)),
+        error_msg(
+            no_color,
             &format!(
                 "The file {} already exists. Use --clobber to overwrite.",
                 path.display()
             ),
-            true,
         );
         return;
     }
@@ -768,15 +765,11 @@ fn read_abused_aws_api_calls(file_path: &str) -> HashMap<String, String> {
             map
         }
         Err(_) => {
-            p(
-                Some(Color::Rgb(255, 0, 0)),
-                &format!(
-                    "Warning: could not open the abused-AWS-API list at '{file_path}' \
-                     (run from the directory that contains ./rules, or after update-rules). \
-                     All API calls will be classified as non-abused."
-                ),
-                true,
-            );
+            log_warn(&format!(
+                "Could not open the abused-AWS-API list at '{file_path}' \
+                 (run from the directory that contains ./rules, or after update-rules). \
+                 All API calls will be classified as non-abused."
+            ));
             HashMap::new()
         }
     }
