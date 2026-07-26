@@ -499,6 +499,7 @@ nav:
       - Git Cloning: getting-started/git-cloning.md
       - Compiling From Source: getting-started/compiling.md
       - Running Suzaku: getting-started/running.md
+      - Converting Logs to Parquet: getting-started/parquet-input.md
   - Commands:
       - Command List: commands/index.md
       - Analysis Commands: commands/analysis.md

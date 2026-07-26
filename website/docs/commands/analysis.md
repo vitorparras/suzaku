@@ -11,8 +11,8 @@ We are currently using this command to figure out which API calls are the most c
 Usage: suzaku aws-ct-metrics [OPTIONS] <--directory <DIR>|--file <FILE>>
 
 Input:
-  -d, --directory <DIR>  Directory of multiple gz/json files
-  -f, --file <FILE>      File path to one gz/json file
+  -d, --directory <DIR>  Directory of multiple gz/json/parquet files
+  -f, --file <FILE>      File path to one gz/json/parquet file
 
 Filtering:
       --timeline-start <DATE>  Start time of the events to load (ex: "2022-02-22T23:59:59Z)
