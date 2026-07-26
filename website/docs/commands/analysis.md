@@ -24,8 +24,8 @@ For example, a large `-` share for `userIdentity.accessKeyId` tells you how much
 Usage: suzaku aws-ct-metrics <INPUT> [OPTIONS]
 
 Input:
-  -d, --directory <DIR>  Directory of multiple gz/json files
-  -f, --file <FILE>      File path to one gz/json file
+  -d, --directory <DIR>  Directory of multiple gz/json/parquet files
+  -f, --file <FILE>      File path to one gz/json/parquet file
 
 Filtering:
   -s, --include-sts-keys       Include temporary AWS STS access key IDs

@@ -7,12 +7,13 @@ use crate::core::util::p;
 use crate::option::cli::{FileDateOption, TimeOption, TimelineOptions};
 use crate::option::timefiler::{filter_by_time, filter_file_by_date_path};
 use bytesize::ByteSize;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use colored::Colorize;
 use console::style;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use num_format::{Locale, ToFormattedString};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator};
@@ -36,11 +37,16 @@ pub fn scan_file<'a>(
     correlation_engine: &'a CorrelationEngine,
     log: &LogSource,
 ) {
-    let log_contents = get_content(f);
-    let events = if f.display().to_string().ends_with(".csv") {
-        parse_csv_events(&log_contents)
+    let path_str = f.display().to_string();
+    let events = if path_str.ends_with(".csv") {
+        parse_csv_events(&get_content(f))
+    } else if path_str.ends_with(".parquet") {
+        match load_parquet_events(f) {
+            Ok(value) => value,
+            Err(_e) => return,
+        }
     } else {
-        match load_json_from_file(&log_contents, log) {
+        match load_json_from_file(&get_content(f), log) {
             Ok(value) => value,
             Err(_e) => return,
         }
@@ -168,6 +174,21 @@ where
             let size = ByteSize::b(size).display().to_string();
             let pb_msg = format!("{path_str} ({size})");
             pb.set_message(pb_msg);
+        }
+        if path_str.ends_with("parquet") {
+            // Warn rather than silently skipping, matching the json/gz branches below,
+            // so an unreadable or over-cap Parquet file does not overstate coverage.
+            match load_parquet_events(&path) {
+                Ok(events) => {
+                    let events = normalize_events(events, log);
+                    process_events(&events);
+                }
+                Err(e) => log_warn(&format!("Skipping {path_str}: {e}")),
+            }
+            if show_progress {
+                pb.inc(1);
+            }
+            continue;
         }
         let log_contents = if path_str.ends_with("json")
             || path_str.ends_with("jsonl")
@@ -598,7 +619,11 @@ fn count_files_recursive(
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|s| s.to_str())
-                && (ext == "json" || ext == "jsonl" || ext == "gz" || ext == "csv")
+                && (ext == "json"
+                    || ext == "jsonl"
+                    || ext == "gz"
+                    || ext == "csv"
+                    || ext == "parquet")
             {
                 // The date filter matches on the path string; filenames need not be valid UTF-8
                 // (e.g. on Linux), so render lossily *only for the filter*. The real `PathBuf` is
@@ -653,6 +678,109 @@ fn read_gz_file_capped(file_path: &PathBuf, max_bytes: u64) -> io::Result<String
     }
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
+/// CloudTrail fields that are objects in the original JSON schema. Parquet pipelines
+/// (Athena CTAS, Glue, Firehose) often store these variable-schema fields as serialized
+/// JSON strings because their keys differ per event; parse them back into objects so
+/// rules can match nested values like `requestParameters.bucketName`. Only these known
+/// envelope fields are parsed — free-text fields such as `errorMessage` are left alone
+/// even if they happen to contain JSON-looking text.
+const JSON_STRING_FIELDS: [&str; 8] = [
+    "userIdentity",
+    "requestParameters",
+    "responseElements",
+    "additionalEventData",
+    "serviceEventDetails",
+    "resources",
+    "tlsDetails",
+    "insightDetails",
+];
+
+/// Normalize one Parquet row into the shape the JSON pipeline produces: revive
+/// JSON-string envelope fields and mark naive `eventTime` timestamps as UTC
+/// (Parquet TIMESTAMP columns without a timezone render as "2026-05-03T16:05:07",
+/// which the RFC 3339 consumers downstream — time filter, summary — reject;
+/// CloudTrail timestamps are always UTC).
+fn normalize_parquet_event(mut v: Value) -> Value {
+    if let Value::Object(map) = &mut v {
+        for key in JSON_STRING_FIELDS {
+            if let Some(Value::String(s)) = map.get(key)
+                && let Ok(parsed) = serde_json::from_str::<Value>(s)
+                && matches!(parsed, Value::Object(_) | Value::Array(_))
+            {
+                map.insert(key.to_string(), parsed);
+            }
+        }
+        if let Some(Value::String(ts)) = map.get_mut("eventTime")
+            && NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+        {
+            ts.push('Z');
+        }
+    }
+    v
+}
+
+/// Upper bound on the JSON-decoded size of a single `.parquet` input. Parquet is a
+/// compressed columnar format (this build enables snappy/zstd/gzip/lz4), so a small
+/// crafted file can inflate to many GB and OOM-kill the whole scan — the same
+/// decompression-bomb class capped for `.gz` above, and `.parquet` files are
+/// auto-discovered during a `-d` walk over an attacker-influenceable log tree.
+const MAX_PARQUET_DECODED_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GiB
+
+/// Read a Parquet file and convert each row into one JSON event object.
+/// Nested columns (structs/lists) become nested JSON values; see
+/// `normalize_parquet_event` for how string-encoded envelope fields and
+/// timezone-less timestamps are handled.
+pub fn load_parquet_events(file_path: &PathBuf) -> Result<Vec<Value>, Box<dyn Error>> {
+    load_parquet_events_capped(file_path, MAX_PARQUET_DECODED_BYTES)
+}
+
+/// Decodes a Parquet file into events, refusing to buffer more than `max_bytes` of
+/// JSON-decoded data. Batches are serialized and accumulated one at a time so a bomb
+/// is caught after roughly one batch past the ceiling rather than after the whole file
+/// is expanded in memory; over the limit returns an error so the caller's per-file
+/// handling (`Err(_) => return`/`if let Ok`) skips just that file and the scan continues.
+fn load_parquet_events_capped(
+    file_path: &PathBuf,
+    max_bytes: u64,
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut events = Vec::new();
+    let mut decoded_bytes: u64 = 0;
+    for batch in reader {
+        let mut buf = Vec::new();
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        writer.write(&batch?)?;
+        writer.finish()?;
+        decoded_bytes += buf.len() as u64;
+        if decoded_bytes > max_bytes {
+            // The descriptive message is carried in the error so the caller's
+            // single "Skipping <file>: <err>" line reports the reason.
+            return Err(format!(
+                "decoded size exceeds the {} GiB limit (possible parquet bomb)",
+                max_bytes / (1024 * 1024 * 1024)
+            )
+            .into());
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        if let Value::Array(rows) = serde_json::from_slice::<Value>(&buf)? {
+            events.extend(rows.into_iter().map(normalize_parquet_event));
+        }
+    }
+    Ok(events)
+}
+
+/// Load AWS events from one file of any supported format (json/jsonl/gz/parquet).
+pub fn load_aws_events_from_file(f: &PathBuf) -> Result<Vec<Value>, Box<dyn Error>> {
+    if f.display().to_string().ends_with(".parquet") {
+        load_parquet_events(f)
+    } else {
+        load_json_from_file(&get_content(f), &LogSource::Aws)
+    }
+}
+
 pub fn load_json_from_file(
     log_contents: &str,
     log: &LogSource,
@@ -719,6 +847,39 @@ pub fn get_content(f: &PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_parquet_events_athena_style() {
+        // Envelope fields stored as JSON strings and eventTime as a naive TIMESTAMP,
+        // the shape Athena CTAS / Glue pipelines produce.
+        let result = load_parquet_events(&PathBuf::from("test_files/parquet/test.parquet"));
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 29);
+        assert!(events[0]["userIdentity"].is_object());
+        let ts = events[0]["eventTime"].as_str().unwrap();
+        assert!(ts.ends_with('Z'), "eventTime not marked as UTC: {ts}");
+    }
+
+    #[test]
+    fn test_load_parquet_events_nested_structs() {
+        let result = load_parquet_events(&PathBuf::from("test_files/parquet/DeleteTrail.parquet"));
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["eventName"], "DeleteTrail");
+        assert!(events[0]["userIdentity"].is_object());
+    }
+
+    #[test]
+    fn test_load_parquet_events_bomb_cap() {
+        let path = PathBuf::from("test_files/parquet/test.parquet");
+        // A ceiling below the fixture's decoded size is rejected (skipped), not truncated.
+        assert!(load_parquet_events_capped(&path, 1).is_err());
+        // A generous ceiling loads every row.
+        let events = load_parquet_events_capped(&path, MAX_PARQUET_DECODED_BYTES).unwrap();
+        assert_eq!(events.len(), 29);
+    }
 
     #[test]
     fn test_load_event_from_file() {

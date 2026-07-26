@@ -1,7 +1,7 @@
 use crate::core::color::SuzakuColor::Red;
 use crate::core::errorlog::log_error;
 use crate::core::log_source::LogSource;
-use crate::core::scan::{get_content, load_json_from_file, process_events_from_dir};
+use crate::core::scan::{load_aws_events_from_file, process_events_from_dir};
 use crate::core::timeline_writer::resolve_output_targets;
 use crate::core::util::{
     error_msg, fatal_error, get_writer, output_path_info, p, sanitize_csv_field, upsert_count_entry,
@@ -191,8 +191,7 @@ pub fn aws_metrics(opt: &MetricsOptions, no_color: bool) {
             log_error(&format!("Failed to scan directory {}: {e}", d.display()));
         }
     } else if let Some(f) = file {
-        let log_contents = get_content(f);
-        match load_json_from_file(&log_contents, &LogSource::Aws) {
+        match load_aws_events_from_file(f) {
             Ok(events) => stats_func(&events),
             Err(_) => return,
         }
