@@ -1,6 +1,13 @@
 name: Rust
 
 on:
+  # A run triggered by `pull_request` saves its cache under that PR's own scope, which
+  # no other PR can read. Only caches written on the default branch are restorable by
+  # every PR, so without this `push` trigger there is never a warm cache to restore and
+  # each PR pays a full cold build of the bundled DuckDB C++ engine.
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - "*"
@@ -53,7 +60,7 @@ jobs:
           targets: ${{ matrix.info.target }}
       - name: Enable Rust cache
         if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
-        uses: Swatinem/rust-cache@6fd3edff6979b79f87531400ad694fb7f2c84b1f #2.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Fmt Check
         run: cargo fmt -- --check
       - name: Prepare Clippy
@@ -80,7 +87,12 @@ jobs:
           RUST_BACKTRACE: full
           OPENSSL_STATIC: "1"
           PKG_CONFIG_ALLOW_CROSS: "1"
+      # `--target` must match the "Build tests" step above. Cargo puts artifacts in
+      # `target/<triple>/debug` when `--target` is passed and in `target/debug` when it
+      # is not, even where host == target, so omitting it here made this step rebuild
+      # the entire dependency tree from scratch — including the bundled DuckDB C++
+      # engine — instead of reusing what "Build tests" just built.
       - name: Run tests
         env:
           RUST_TEST_THREADS: 1
-        run: cargo test --verbose
+        run: cargo test --verbose --target=${{ matrix.info.target }}
