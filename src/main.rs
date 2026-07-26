@@ -7,9 +7,10 @@ use crate::cmd::azure::azure_timeline::azure_timeline;
 use chrono::Local;
 use clap::{CommandFactory, Parser};
 use cmd::update::start_update_rules;
-use core::color::SuzakuColor::Green;
+use core::color::SuzakuColor::{Green, Orange};
+use core::errorlog;
 use core::timeline_writer::resolve_output_paths;
-use core::util::{check_path_exists, p, set_rayon_threat_number};
+use core::util::{check_path_exists, error_msg, p, set_rayon_threat_number};
 use libmimalloc_sys::mi_stats_print_out;
 use mimalloc::MiMalloc;
 use option::cli::Commands::{
@@ -65,6 +66,7 @@ fn main() {
             if !check_path_exists(
                 options.input_opt.filepath.clone(),
                 options.input_opt.directory.clone(),
+                no_color,
             ) {
                 return;
             }
@@ -86,22 +88,20 @@ fn main() {
                         .map(|path| path.display().to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    p(
-                        None,
+                    error_msg(
+                        no_color,
                         &format!(
                             "The output file already exists: {names}. Please specify a different filename or add the -C, --clobber option to overwrite."
                         ),
-                        true,
                     );
                     return;
                 }
             }
 
             if !options.rules.exists() {
-                p(
-                    None,
+                error_msg(
+                    no_color,
                     &format!("Rule file or directory does not exist: {:?}", options.rules),
-                    true,
                 );
                 return;
             }
@@ -114,15 +114,14 @@ fn main() {
                     .iter()
                     .any(|f| matches!(f, OutputFormat::Json | OutputFormat::Jsonl))
             {
-                p(
-                    None,
+                error_msg(
+                    no_color,
                     "--raw-output option is only available in JSON formats. Please add json or jsonl to -t, --output-type.",
-                    true,
                 );
                 return;
             }
 
-            if !validate_min_level(&options.min_level) {
+            if !validate_min_level(&options.min_level, no_color) {
                 return;
             }
 
@@ -144,6 +143,7 @@ fn main() {
             if !check_path_exists(
                 options.input_opt.filepath.clone(),
                 options.input_opt.directory.clone(),
+                no_color,
             ) {
                 return;
             }
@@ -165,12 +165,11 @@ fn main() {
                         .map(|path| path.display().to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    p(
-                        None,
+                    error_msg(
+                        no_color,
                         &format!(
                             "The output file already exists: {names}. Please specify a different filename or add the -C, --clobber option to overwrite."
                         ),
-                        true,
                     );
                     return;
                 }
@@ -184,10 +183,9 @@ fn main() {
                     .iter()
                     .any(|f| matches!(f, OutputFormat::Json | OutputFormat::Jsonl))
             {
-                p(
-                    None,
+                error_msg(
+                    no_color,
                     "--raw-output option is only available in JSON formats. Please add json or jsonl to -t, --output-type.",
-                    true,
                 );
                 return;
             }
@@ -201,7 +199,11 @@ fn main() {
             common_opt,
         } => {
             display_logo(common_opt.quiet, no_color, true, false);
-            if !check_path_exists(input_opt.filepath.clone(), input_opt.directory.clone()) {
+            if !check_path_exists(
+                input_opt.filepath.clone(),
+                input_opt.directory.clone(),
+                no_color,
+            ) {
                 return;
             }
             aws_metrics(input_opt, field_name.as_ref(), output, no_color);
@@ -217,7 +219,11 @@ fn main() {
             clobber,
         } => {
             display_logo(common_opt.quiet, no_color, true, false);
-            if !check_path_exists(input_opt.filepath.clone(), input_opt.directory.clone()) {
+            if !check_path_exists(
+                input_opt.filepath.clone(),
+                input_opt.directory.clone(),
+                no_color,
+            ) {
                 return;
             }
             aws_summary(
@@ -236,6 +242,10 @@ fn main() {
             start_update_rules(no_color);
         }
     }
+
+    // Warnings and errors went to the error log instead of the terminal, so point at it
+    // once here — otherwise a run that skipped half its files would look completely clean.
+    print_error_log_info(no_color);
 
     // Print elapsed time
     let duration = start.elapsed();
@@ -271,7 +281,7 @@ fn main() {
     }
 }
 
-fn validate_min_level(min_level: &str) -> bool {
+fn validate_min_level(min_level: &str, no_color: bool) -> bool {
     const VALID_LEVELS: &[&str] = &[
         "informational",
         "info",
@@ -284,17 +294,32 @@ fn validate_min_level(min_level: &str) -> bool {
     ];
 
     if !VALID_LEVELS.contains(&min_level) {
-        p(
-            None,
+        error_msg(
+            no_color,
             &format!(
-                "Invalid minimum level: {}. Valid levels are: informational, low, medium, high, critical.",
-                min_level
+                "Invalid minimum level: {min_level}. Valid levels are: informational, low, medium, high, critical."
             ),
-            true,
         );
         return false;
     }
     true
+}
+
+fn print_error_log_info(no_color: bool) {
+    let count = errorlog::entry_count();
+    if count == 0 {
+        return;
+    }
+    let Some(path) = errorlog::log_path() else {
+        return;
+    };
+    let noun = if count == 1 { "message" } else { "messages" };
+    p(Orange.rdg(no_color), "Warnings and errors: ", false);
+    p(
+        None,
+        &format!("{count} {noun} saved to {}\n", path.display()),
+        true,
+    );
 }
 
 fn print_issue_reporting_info(no_color: bool) {

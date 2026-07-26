@@ -1,4 +1,5 @@
 use crate::core::color::SuzakuColor::{Green, Red};
+use crate::core::errorlog::log_error;
 use crate::core::log_source::LogSource;
 use crate::core::rules;
 use crate::core::scan::{append_summary_data, scan_directory, scan_file};
@@ -249,11 +250,7 @@ fn process_correlation_events(
             }
         }
         Err(e) => {
-            p(
-                Red.rdg(context.config.no_color),
-                &format!("Error processing correlation events: {e}"),
-                true,
-            );
+            log_error(&format!("Error processing correlation events: {e}"));
             return true;
         }
     }

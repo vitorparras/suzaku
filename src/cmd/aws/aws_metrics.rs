@@ -1,7 +1,7 @@
-use crate::core::color::SuzakuColor::Red;
+use crate::core::errorlog::log_error;
 use crate::core::log_source::LogSource;
 use crate::core::scan::{get_content, load_json_from_file, process_events_from_dir};
-use crate::core::util::{fatal_error, get_writer, output_path_info, p, sanitize_csv_field};
+use crate::core::util::{error_msg, fatal_error, get_writer, output_path_info, sanitize_csv_field};
 use crate::option::cli::InputOption;
 use crate::option::timefiler::filter_by_time;
 use comfy_table::{Cell, CellAlignment, Table};
@@ -11,7 +11,6 @@ use sigma_rust::{Event, event_from_json};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use termcolor::Color;
 
 pub fn aws_metrics(input_opt: &InputOption, field: &str, output: &Option<PathBuf>, no_color: bool) {
     let directory = &input_opt.directory;
@@ -50,11 +49,7 @@ pub fn aws_metrics(input_opt: &InputOption, field: &str, output: &Option<PathBuf
             &LogSource::Aws,
             &input_opt.file_date_opt,
         ) {
-            p(
-                Red.rdg(no_color),
-                &format!("Failed to scan directory {}: {e}", d.display()),
-                true,
-            );
+            log_error(&format!("Failed to scan directory {}: {e}", d.display()));
         }
         print_count_map_desc(csv_header, &count_map, wtr, output, no_color);
     } else if let Some(f) = file {
@@ -86,7 +81,7 @@ fn print_count_map_desc(
     let total: i32 = total_map.values().sum();
 
     if total == 0 {
-        p(Some(Color::Rgb(255, 0, 0)), "No events found.", true);
+        error_msg(no_color, "No events found.");
         return;
     }
 
