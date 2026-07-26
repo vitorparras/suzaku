@@ -1,6 +1,13 @@
 name: Rust
 
 on:
+  # A run triggered by `pull_request` saves its cache under that PR's own scope, which
+  # no other PR can read. Only caches written on the default branch are restorable by
+  # every PR, so without this `push` trigger there is never a warm cache to restore and
+  # each PR pays a full cold build of the bundled DuckDB C++ engine.
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - "*"
