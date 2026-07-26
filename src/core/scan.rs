@@ -710,26 +710,56 @@ fn normalize_parquet_event(mut v: Value) -> Value {
     v
 }
 
+/// Upper bound on the JSON-decoded size of a single `.parquet` input. Parquet is a
+/// compressed columnar format (this build enables snappy/zstd/gzip/lz4), so a small
+/// crafted file can inflate to many GB and OOM-kill the whole scan — the same
+/// decompression-bomb class capped for `.gz` above, and `.parquet` files are
+/// auto-discovered during a `-d` walk over an attacker-influenceable log tree.
+const MAX_PARQUET_DECODED_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GiB
+
 /// Read a Parquet file and convert each row into one JSON event object.
 /// Nested columns (structs/lists) become nested JSON values; see
 /// `normalize_parquet_event` for how string-encoded envelope fields and
 /// timezone-less timestamps are handled.
 pub fn load_parquet_events(file_path: &PathBuf) -> Result<Vec<Value>, Box<dyn Error>> {
+    load_parquet_events_capped(file_path, MAX_PARQUET_DECODED_BYTES)
+}
+
+/// Decodes a Parquet file into events, refusing to buffer more than `max_bytes` of
+/// JSON-decoded data. Batches are serialized and accumulated one at a time so a bomb
+/// is caught after roughly one batch past the ceiling rather than after the whole file
+/// is expanded in memory; over the limit returns an error so the caller's per-file
+/// handling (`Err(_) => return`/`if let Ok`) skips just that file and the scan continues.
+fn load_parquet_events_capped(
+    file_path: &PathBuf,
+    max_bytes: u64,
+) -> Result<Vec<Value>, Box<dyn Error>> {
     let file = File::open(file_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+    let mut events = Vec::new();
+    let mut decoded_bytes: u64 = 0;
     for batch in reader {
+        let mut buf = Vec::new();
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
         writer.write(&batch?)?;
+        writer.finish()?;
+        decoded_bytes += buf.len() as u64;
+        if decoded_bytes > max_bytes {
+            eprintln!(
+                "[WARNING] Skipping {}: decoded size exceeds the {} GiB limit (possible parquet bomb).",
+                file_path.display(),
+                max_bytes / (1024 * 1024 * 1024)
+            );
+            return Err("decoded size exceeds the maximum allowed limit".into());
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        if let Value::Array(rows) = serde_json::from_slice::<Value>(&buf)? {
+            events.extend(rows.into_iter().map(normalize_parquet_event));
+        }
     }
-    writer.finish()?;
-    if buf.is_empty() {
-        return Ok(Vec::new());
-    }
-    match serde_json::from_slice::<Value>(&buf)? {
-        Value::Array(rows) => Ok(rows.into_iter().map(normalize_parquet_event).collect()),
-        _ => Ok(Vec::new()),
-    }
+    Ok(events)
 }
 
 /// Load AWS events from one file of any supported format (json/jsonl/gz/parquet).
@@ -824,6 +854,16 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["eventName"], "DeleteTrail");
         assert!(events[0]["userIdentity"].is_object());
+    }
+
+    #[test]
+    fn test_load_parquet_events_bomb_cap() {
+        let path = PathBuf::from("test_files/parquet/test.parquet");
+        // A ceiling below the fixture's decoded size is rejected (skipped), not truncated.
+        assert!(load_parquet_events_capped(&path, 1).is_err());
+        // A generous ceiling loads every row.
+        let events = load_parquet_events_capped(&path, MAX_PARQUET_DECODED_BYTES).unwrap();
+        assert_eq!(events.len(), 29);
     }
 
     #[test]
