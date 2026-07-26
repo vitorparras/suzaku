@@ -193,20 +193,18 @@ fn main() {
             aws_search(options, common_opt);
         }
         AwsCtMetrics {
-            input_opt,
-            output,
-            field_name,
+            options,
             common_opt,
         } => {
             display_logo(common_opt.quiet, no_color, true, false);
             if !check_path_exists(
-                input_opt.filepath.clone(),
-                input_opt.directory.clone(),
+                options.input_opt.filepath.clone(),
+                options.input_opt.directory.clone(),
                 no_color,
             ) {
                 return;
             }
-            aws_metrics(input_opt, field_name.as_ref(), output, no_color);
+            aws_metrics(options, no_color);
         }
         AwsCtSummary {
             input_opt,
