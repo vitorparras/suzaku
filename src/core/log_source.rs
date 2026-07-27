@@ -15,6 +15,17 @@ impl LogSource {
         }
     }
 
+    /// The timeline subcommand this log source belongs to, as the user typed it. Recorded in the
+    /// DuckDB `suzaku_meta.command` column so a consumer can look up what produced a file rather
+    /// than inferring it from which tables and columns happen to be present.
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            LogSource::Aws => "aws-ct-timeline",
+            LogSource::Azure => "azure-timeline",
+            LogSource::All => "timeline",
+        }
+    }
+
     /// File name (under the rules directory's `config/`) listing rule UUIDs to skip loading.
     pub fn ignore_rule_list_filename(&self) -> &str {
         match self {

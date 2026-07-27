@@ -1,4 +1,5 @@
 use crate::core::color::SuzakuColor::{Green, Red};
+use crate::core::duckdb_out::SuzakuMeta;
 use crate::core::log_source::LogSource;
 use crate::core::scan::{load_aws_events_from_file, process_events_from_dir};
 use crate::core::timeline_writer::{OutputConfig, OutputContext, init_writers, write_record};
@@ -38,6 +39,7 @@ pub fn aws_search(options: &SearchOptions, common_opt: &CommonOptions) {
         options.output_opt.output.as_ref(),
         &options.output_opt.output_types,
         &profile,
+        SuzakuMeta::new("aws-ct-search"),
     )
     .unwrap_or_else(|e| fatal_error(no_color, &e));
     let config = OutputConfig::new(no_color, options.output_opt.raw_output, false);
@@ -124,8 +126,9 @@ level: informational";
         }
     };
 
+    let mut scanned_files = 0usize;
     if let Some(d) = directory {
-        if let Err(e) = process_events_from_dir(
+        match process_events_from_dir(
             search_func,
             d,
             options.output_opt.output.is_some(),
@@ -133,22 +136,25 @@ level: informational";
             &LogSource::Aws,
             &options.input_opt.file_date_opt,
         ) {
-            p(
+            Ok(files) => scanned_files = files,
+            Err(e) => p(
                 Red.rdg(no_color),
                 &format!("Failed to scan directory {}: {e}", d.display()),
                 true,
-            );
+            ),
         }
     } else if let Some(f) = file {
         let events = load_aws_events_from_file(f);
         if let Ok(events) = events {
             search_func(&events);
+            scanned_files = 1;
         }
     }
 
     // Flush the writers and, when nothing matched, clean up the empty output files (mirrors the
     // timeline command). Without this, aws-ct-search left a zero-row file behind for every format
     // even though it reports "Results saved: None".
+    context.set_scan_stats(Some(scanned_files as i64), Some(total_events as i64));
     context.flush_all();
 
     display_results(matched_events, total_events, no_color);

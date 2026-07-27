@@ -1,4 +1,5 @@
 use crate::core::color::SuzakuColor::{Green, Red};
+use crate::core::duckdb_out::SuzakuMeta;
 use crate::core::errorlog::log_error;
 use crate::core::log_source::LogSource;
 use crate::core::rules;
@@ -115,10 +116,16 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
         true,
     );
 
+    // Provenance for the DuckDB output: which command, which ruleset, which timezone. A DFIR
+    // report has to be able to cite these, and today they are unknowable from the file.
+    let meta = SuzakuMeta::new(log.command_name())
+        .with_localtime(options.localtime)
+        .with_rules(&options.rules, rules.len() + total_correlation_rules);
     let (writers, output_pathes) = init_writers(
         options.output_opt.output.as_ref(),
         &options.output_opt.output_types,
         &profile,
+        meta,
     )
     .unwrap_or_else(|e| fatal_error(no_color, &e));
     let config = OutputConfig::new(no_color, options.output_opt.raw_output, options.localtime);
@@ -128,7 +135,7 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
     let mut matched_correlation: Vec<TimestampedEvent> = Vec::new();
     context.write_header();
 
-    if let Some(d) = &options.input_opt.directory {
+    let scanned_files = if let Some(d) = &options.input_opt.directory {
         scan_directory(
             d,
             &mut context,
@@ -138,7 +145,7 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
             &mut matched_correlation,
             &correlation_engine,
             &log,
-        );
+        )
     } else if let Some(f) = &options.input_opt.filepath {
         scan_file(
             f,
@@ -150,7 +157,10 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
             &correlation_engine,
             &log,
         );
-    }
+        1
+    } else {
+        0
+    };
 
     process_correlation_events(
         &mut context,
@@ -159,6 +169,10 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
         &correlation_engine,
     );
 
+    context.set_scan_stats(
+        Some(scanned_files as i64),
+        Some(summary.total_events as i64),
+    );
     context.flush_all();
     println!();
     let terminal_width = match terminal_size() {

@@ -1,5 +1,10 @@
 use crate::core::color::SuzakuColor;
 use crate::core::color::SuzakuColor::{Green, Orange, Red, White, Yellow};
+use crate::core::duckdb_out::{
+    self, LEVEL_TYPE, MULTI_VALUE_SEPARATOR, SuzakuMeta, list_expr, nullable, quote_ident,
+    timestamp_expr,
+};
+use crate::core::errorlog::log_error;
 use crate::core::util::{get_json_writer, get_writer, sanitize_csv_field};
 use crate::option::cli::OutputFormat;
 use crate::option::geoip::GeoIPSearch;
@@ -62,42 +67,152 @@ pub struct Writers {
 /// stays bounded on huge scans.
 const DUCKDB_BATCH_ROWS: usize = 10_000;
 
-/// DuckDB output sink: a `.duckdb` database file with a single `timeline` table whose columns
-/// are the output-profile headers (all `VARCHAR`, since every Suzaku value is a string). Unlike
-/// the CSV/JSON sinks this is not a byte stream, so it lives outside the `dyn Write` writers.
+/// Name of the staging table rows are appended to before the final typed rewrite.
 ///
-/// Rows are buffered and written through DuckDB's `Appender` in batches. A per-row
+/// It is a `TEMP` table on purpose: temp data lives outside the database file, so the finished
+/// `.duckdb` holds only the typed `timeline` table and does not carry the raw copy's blocks
+/// around forever (DuckDB reuses freed blocks but never shrinks the file).
+const DUCKDB_STAGING_TABLE: &str = "suzaku_timeline_staging";
+
+/// The grain of the `timeline` table, recorded as a table comment so a reader can discover it
+/// from the file instead of guessing. `EventID` is deliberately *not* unique: one event matching
+/// several rules legitimately produces one row per match.
+const TIMELINE_GRAIN: &str = "One row per (event x rule match): an event matching several rules \
+     produces one row per match, so EventID is not unique. Exact-duplicate rows are removed on \
+     write; see suzaku_meta.duplicate_rows_removed.";
+
+/// How a rule tag is rendered once abbreviated (see [`abbreviate_tag`]), so the packed `Tags`
+/// string can be split into typed lists instead of leaving consumers to guess with a
+/// "starts with T and a digit" heuristic.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum TagKind {
+    /// An ATT&CK tactic abbreviation from `config/mitre_tactics.txt`, e.g. `PrivEsc`.
+    Tactic,
+    /// An ATT&CK technique ID, e.g. `T1078.004`.
+    Technique,
+    /// Anything else Suzaku passes through: group IDs (`G0035`), `cve.*`, `car.*`.
+    Other,
+}
+
+/// Classify one already-abbreviated tag. Done here rather than in SQL because this is where the
+/// tag vocabulary is known — `mitre_tactics()` is the same table that produced the abbreviation.
+fn classify_tag(tag: &str) -> TagKind {
+    if mitre_tactics().values().any(|abbrev| abbrev == tag) {
+        return TagKind::Tactic;
+    }
+    let mut chars = tag.chars();
+    if matches!(chars.next(), Some('T')) && matches!(chars.next(), Some(c) if c.is_ascii_digit()) {
+        return TagKind::Technique;
+    }
+    TagKind::Other
+}
+
+/// Split a packed `Tags` value into the `(tactics, techniques, other)` triple written to the
+/// three list columns, each still [`MULTI_VALUE_SEPARATOR`]-joined for the staging table.
+fn split_tags(tags: &str) -> [String; 3] {
+    let mut buckets = [Vec::new(), Vec::new(), Vec::new()];
+    for tag in tags.split(MULTI_VALUE_SEPARATOR) {
+        let tag = tag.trim();
+        if tag.is_empty() || tag == "-" {
+            continue;
+        }
+        let bucket = match classify_tag(tag) {
+            TagKind::Tactic => 0,
+            TagKind::Technique => 1,
+            TagKind::Other => 2,
+        };
+        buckets[bucket].push(tag);
+    }
+    buckets.map(|b| b.join(MULTI_VALUE_SEPARATOR))
+}
+
+/// The DuckDB columns the `Tags` profile column expands into, in output order.
+const TAG_COLUMNS: [&str; 3] = ["Tactics", "TechniqueIDs", "OtherTags"];
+
+/// Column name used in the DuckDB output for an output-profile key.
+///
+/// The only rewrite today is `AWS-Region` -> `AwsRegion`. A hyphen makes the identifier illegal
+/// unquoted, so every consumer — and every piece of ad-hoc or generated SQL — has to remember to
+/// double-quote it forever, which is a cost paid on every query to save one character here.
+fn duckdb_column_name(profile_key: &str) -> String {
+    match profile_key {
+        "AWS-Region" => "AwsRegion".to_string(),
+        other => other.replace('-', ""),
+    }
+}
+
+/// DuckDB output sink: a `.duckdb` database file holding a typed `timeline` table plus the
+/// `suzaku_meta` provenance table. Unlike the CSV/JSON sinks this is not a byte stream, so it
+/// lives outside the `dyn Write` writers.
+///
+/// Rows arrive as strings (that is what the output profile produces) and are appended to a
+/// `TEMP` staging table through DuckDB's `Appender` in batches. A per-row
 /// `INSERT INTO ... VALUES` re-parses and re-plans the statement and commits its own transaction
-/// every time, which made `-t duckdb` roughly 200x slower per row than the appender path (and the
-/// whole command ~10x slower than `-t csv`). `aws-ct-summary` already writes through an appender;
-/// this brings the timeline output in line.
+/// every time, which made `-t duckdb` roughly 200x slower per row than the appender path.
+///
+/// [`Self::finalize`] then rewrites the staging table into the real one in a single statement:
+/// that is where placeholders become NULL, text becomes `TIMESTAMP`/`ENUM`/`VARCHAR[]`, exact
+/// duplicates are dropped and rows are sorted by time. Doing it in one pass at the end — rather
+/// than typing each value in Rust on the way in — keeps the hot append path untouched, lets one
+/// unparseable value degrade to a `NULL` instead of failing the run, and is the only way to
+/// produce `LIST` columns, which the appender API cannot bind.
 struct DuckDbSink {
     conn: Connection,
+    /// DuckDB column names, in record order, with `Tags` already expanded to [`TAG_COLUMNS`].
+    columns: Vec<String>,
+    /// Index of the `Tags` value inside an incoming record, when the profile has one.
+    tags_index: Option<usize>,
     /// Rows accumulated since the last flush, drained into an `Appender` by [`Self::flush`].
     pending: Vec<Vec<String>>,
+    /// Provenance written to `suzaku_meta` by [`Self::finalize`].
+    meta: SuzakuMeta,
 }
 
 impl DuckDbSink {
-    fn new(path: &Path, columns: &[String]) -> Result<Self, String> {
+    fn new(path: &Path, profile_keys: &[String], meta: SuzakuMeta) -> Result<Self, String> {
+        let tags_index = profile_keys.iter().position(|k| k == "Tags");
+        let mut columns: Vec<String> = Vec::with_capacity(profile_keys.len() + 2);
+        for key in profile_keys {
+            if key == "Tags" {
+                columns.extend(TAG_COLUMNS.iter().map(|c| c.to_string()));
+            } else {
+                columns.push(duckdb_column_name(key));
+            }
+        }
+
         let conn = Connection::open(path)
             .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
         let cols_ddl = columns
             .iter()
-            .map(|c| format!("\"{}\" VARCHAR", c.replace('"', "\"\"")))
+            .map(|c| format!("{} VARCHAR", quote_ident(c)))
             .collect::<Vec<_>>()
             .join(", ");
-        // CREATE OR REPLACE so re-running over an existing .duckdb file overwrites the table,
-        // matching the truncate-on-write behavior of the CSV/JSON file writers.
-        conn.execute_batch(&format!("CREATE OR REPLACE TABLE timeline ({cols_ddl});"))
-            .map_err(|e| format!("Cannot create DuckDB table in {}: {e}", path.display()))?;
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE {DUCKDB_STAGING_TABLE} ({cols_ddl});"
+        ))
+        .map_err(|e| format!("Cannot create DuckDB table in {}: {e}", path.display()))?;
         Ok(Self {
             conn,
+            columns,
+            tags_index,
             pending: Vec::with_capacity(DUCKDB_BATCH_ROWS),
+            meta,
         })
     }
 
     fn append_row(&mut self, record: &[String]) {
-        self.pending.push(record.to_vec());
+        let row = match self.tags_index {
+            // Expand the packed tag string in place, keeping every other column where it was.
+            Some(i) if i < record.len() => {
+                let mut row = Vec::with_capacity(self.columns.len());
+                row.extend_from_slice(&record[..i]);
+                row.extend(split_tags(&record[i]));
+                row.extend_from_slice(&record[i + 1..]);
+                row
+            }
+            _ => record.to_vec(),
+        };
+        self.pending.push(row);
         if self.pending.len() >= DUCKDB_BATCH_ROWS {
             self.flush();
         }
@@ -110,9 +225,12 @@ impl DuckDbSink {
         if self.pending.is_empty() {
             return;
         }
-        // Errors shouldn't abort the whole scan; drop the batch (rare — the schema is fixed and
-        // every value is a string).
-        if let Ok(mut appender) = self.conn.appender("timeline") {
+        // Errors shouldn't abort the whole scan; drop the batch (rare — the staging schema is
+        // fixed and every value is a string).
+        if let Ok(mut appender) =
+            self.conn
+                .appender_to_catalog_and_db(DUCKDB_STAGING_TABLE, "temp", "main")
+        {
             for row in &self.pending {
                 let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
                 let _ = appender.append_row(params.as_slice());
@@ -120,6 +238,86 @@ impl DuckDbSink {
             let _ = appender.flush();
         }
         self.pending.clear();
+    }
+
+    /// The `SELECT` expression producing one final column from its staging counterpart.
+    fn column_expr(&self, column: &str) -> String {
+        let quoted = quote_ident(column);
+        let expr = match column {
+            "Timestamp" => timestamp_expr(&quoted),
+            // `lower` because the terminal writer abbreviates severities in place; the file
+            // writers never see that, but an unexpected spelling should not become a silent NULL.
+            "Level" => format!("TRY_CAST(lower({}) AS {LEVEL_TYPE})", nullable(&quoted)),
+            c if TAG_COLUMNS.contains(&c) => list_expr(&quoted),
+            _ => nullable(&quoted),
+        };
+        format!("{expr} AS {quoted}")
+    }
+
+    /// Rewrite the staged strings into the typed `timeline` table, write `suzaku_meta`, and leave
+    /// the file checkpointed and ready to be opened read-only.
+    ///
+    /// `SELECT DISTINCT` is the resolution of the duplicate-row problem: byte-identical rows carry
+    /// no information, but they inflate every count, Top-N and trend a dashboard derives from the
+    /// file (37% of the rows in the reference corpus were exact duplicates, inflating counts ~1.6x).
+    /// They come from re-delivered log records rather than from a bug here, so how many were
+    /// dropped is reported in `suzaku_meta.duplicate_rows_removed` rather than silently discarded.
+    fn finalize(&mut self) -> Result<(), String> {
+        self.flush();
+        if self.columns.iter().any(|c| c == "Level") {
+            duckdb_out::create_level_type(&self.conn)?;
+        }
+        let exprs = self
+            .columns
+            .iter()
+            .map(|c| self.column_expr(c))
+            .collect::<Vec<_>>()
+            .join(",\n       ");
+        // Sorting by time also compresses better: a typed, time-sorted rewrite of the 1.9 M-row
+        // reference corpus measured 15% smaller than the untyped, insertion-ordered table.
+        let order_by = if self.columns.iter().any(|c| c == "Timestamp") {
+            "\nORDER BY \"Timestamp\""
+        } else {
+            ""
+        };
+        self.conn
+            .execute_batch(&format!(
+                "CREATE OR REPLACE TABLE timeline AS\nSELECT DISTINCT {exprs}\nFROM {DUCKDB_STAGING_TABLE}{order_by};"
+            ))
+            .map_err(|e| format!("Cannot write the DuckDB timeline table: {e}"))?;
+
+        let staged = duckdb_out::count_rows(&self.conn, DUCKDB_STAGING_TABLE)?;
+        let written = duckdb_out::count_rows(&self.conn, "timeline")?;
+        self.conn
+            .execute_batch(&format!("DROP TABLE {DUCKDB_STAGING_TABLE};"))
+            .map_err(|e| format!("Cannot drop the DuckDB staging table: {e}"))?;
+
+        self.meta.output_rows = Some(written);
+        self.meta.duplicate_rows_removed = Some(staged - written);
+        duckdb_out::write_meta(&self.conn, &self.meta)?;
+        duckdb_out::comment_on_table(&self.conn, "timeline", TIMELINE_GRAIN)?;
+        for (column, comment) in [
+            (
+                "Timestamp",
+                "Event time. The timezone is stated in suzaku_meta.timestamp_tz.",
+            ),
+            (
+                "Level",
+                "Sigma rule severity. Ordered, so ORDER BY / max() rank by severity; compare \
+                 against a literal with an explicit cast, e.g. Level >= 'high'::suzaku_level.",
+            ),
+            ("Tactics", "ATT&CK tactic abbreviations from the rule tags."),
+            ("TechniqueIDs", "ATT&CK technique IDs from the rule tags."),
+            (
+                "OtherTags",
+                "Rule tags that are neither a tactic nor a technique (e.g. ATT&CK groups, CVEs).",
+            ),
+        ] {
+            if self.columns.iter().any(|c| c == column) {
+                duckdb_out::comment_on_column(&self.conn, "timeline", column, comment)?;
+            }
+        }
+        duckdb_out::checkpoint(&self.conn)
     }
 }
 
@@ -757,6 +955,15 @@ impl<'a> OutputContext<'a> {
         }
     }
 
+    /// Record how much input the run covered, for `suzaku_meta`. Call before [`Self::flush_all`];
+    /// a run whose scan stats are unknown simply leaves the columns NULL.
+    pub fn set_scan_stats(&mut self, scanned_files: Option<i64>, scanned_events: Option<i64>) {
+        if let Some(ref mut sink) = self.writers.duckdb {
+            sink.meta.scanned_files = scanned_files;
+            sink.meta.scanned_events = scanned_events;
+        }
+    }
+
     pub fn flush_all(&mut self) {
         if let Some(ref mut writer) = self.writers.csv {
             writer.flush().unwrap();
@@ -768,7 +975,16 @@ impl<'a> OutputContext<'a> {
             writer.flush().unwrap();
         }
         if let Some(ref mut sink) = self.writers.duckdb {
-            sink.flush();
+            if self.has_written {
+                // Turn the staged strings into the typed, deduplicated table. A failure here
+                // costs the DuckDB output only, so it is logged rather than ending the run that
+                // just spent minutes scanning — the other formats are already written.
+                if let Err(e) = sink.finalize() {
+                    log_error(&e);
+                }
+            } else {
+                sink.flush();
+            }
         }
         if !self.has_written {
             self.writers.csv = None;
@@ -845,12 +1061,14 @@ pub fn resolve_output_paths(output_path: &Path, output_types: &[OutputFormat]) -
 
 /// Build the output writers for the requested formats. Each format writes to `<output>.<ext>`
 /// (the base path's extension is normalized per format), so a single `-o` base path can fan out
-/// to several files at once. `profile` supplies the column names for the DuckDB table. With no
-/// `output_path`, results go to the stdout table and `output_types` is ignored.
+/// to several files at once. `profile` supplies the column names for the DuckDB table, and `meta`
+/// the provenance its `suzaku_meta` table records. With no `output_path`, results go to the
+/// stdout table and `output_types` is ignored.
 pub fn init_writers(
     output_path: Option<&PathBuf>,
     output_types: &[OutputFormat],
     profile: &[(String, String)],
+    meta: SuzakuMeta,
 ) -> Result<(Writers, Vec<PathBuf>), String> {
     let mut output_pathes = vec![];
     let mut writers = Writers::new();
@@ -864,7 +1082,7 @@ pub fn init_writers(
                 OutputFormat::Jsonl => writers.with_jsonl(get_json_writer(&Some(path))?),
                 OutputFormat::Duckdb => {
                     let columns: Vec<String> = profile.iter().map(|(k, _)| k.clone()).collect();
-                    writers.with_duckdb(DuckDbSink::new(&path, &columns)?)
+                    writers.with_duckdb(DuckDbSink::new(&path, &columns, meta.clone())?)
                 }
             };
         }
@@ -1156,44 +1374,414 @@ mod tests {
         }
     }
 
+    /// The full AWS timeline profile, so the schema assertions below run against the real
+    /// column set rather than a hand-picked subset.
+    fn aws_profile_keys() -> Vec<String> {
+        [
+            "Timestamp",
+            "RuleTitle",
+            "Level",
+            "EventName",
+            "ErrorCode",
+            "AWS-Region",
+            "UserName",
+            "EventID",
+            "Tags",
+            "RuleID",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn aws_row(
+        ts: &str,
+        level: &str,
+        error: &str,
+        user: &str,
+        id: &str,
+        tags: &str,
+    ) -> Vec<String> {
+        vec![
+            ts.to_string(),
+            "Rule A".to_string(),
+            level.to_string(),
+            "GetPolicy".to_string(),
+            error.to_string(),
+            "us-east-1".to_string(),
+            user.to_string(),
+            id.to_string(),
+            tags.to_string(),
+            "rule-1".to_string(),
+        ]
+    }
+
+    fn finalized_sink(path: &Path, keys: &[String], rows: &[Vec<String>]) -> Connection {
+        let mut sink = DuckDbSink::new(path, keys, SuzakuMeta::new("aws-ct-timeline")).unwrap();
+        for row in rows {
+            sink.append_row(row);
+        }
+        sink.finalize().unwrap();
+        // Drop the writer connection before re-opening so the assertions read the file, not the
+        // in-flight transaction.
+        drop(sink);
+        Connection::open(path).unwrap()
+    }
+
     #[test]
     fn duckdb_sink_creates_named_table_and_appends_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.duckdb");
-        // A column name with a hyphen must be quoted correctly in the DDL.
-        let cols = vec![
-            "Timestamp".to_string(),
-            "RuleTitle".to_string(),
-            "AWS-Region".to_string(),
-        ];
-        let mut sink = DuckDbSink::new(&path, &cols).unwrap();
-        sink.append_row(&[
-            "2024-01-01".to_string(),
-            "Rule A".to_string(),
-            "us-east-1".to_string(),
-        ]);
-        sink.append_row(&[
-            "2024-01-02".to_string(),
-            "Rule B".to_string(),
-            "ap-northeast-1".to_string(),
-        ]);
-        // Fewer rows than DUCKDB_BATCH_ROWS, so these are still buffered: dropping the sink must
-        // flush them. Dropping also closes the writer connection before re-opening to verify.
-        drop(sink);
+        let keys = aws_profile_keys();
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[
+                aws_row("2024-01-01 00:00:00", "high", "-", "alice", "e1", "-"),
+                aws_row("2024-01-02 00:00:00", "low", "-", "bob", "e2", "-"),
+            ],
+        );
 
-        let conn = Connection::open(&path).unwrap();
         let rows: i64 = conn
             .query_row("SELECT count(*) FROM timeline", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 2);
+        // The hyphenated profile key becomes a plain identifier: no quoting needed, ever.
         let title: String = conn
             .query_row(
-                "SELECT RuleTitle FROM timeline WHERE \"AWS-Region\" = 'ap-northeast-1'",
+                "SELECT RuleTitle FROM timeline WHERE AwsRegion = 'us-east-1' AND UserName = 'bob'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(title, "Rule B");
+        assert_eq!(title, "Rule A");
+    }
+
+    /// P2: `-` and `''` are CSV presentation conventions. In DuckDB the absence of a value must be
+    /// NULL, or `ErrorCode IS NOT NULL` silently answers the wrong question.
+    #[test]
+    fn duckdb_sink_writes_null_not_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[
+                aws_row("2024-01-01 00:00:00", "high", "-", "", "e1", "-"),
+                aws_row(
+                    "2024-01-02 00:00:00",
+                    "high",
+                    "AccessDenied",
+                    "bob",
+                    "e2",
+                    "-",
+                ),
+            ],
+        );
+
+        let (nulls, dashes, failures): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT count(*) FILTER (WHERE ErrorCode IS NULL),
+                        count(*) FILTER (WHERE ErrorCode = '-'),
+                        count(*) FILTER (WHERE ErrorCode IS NOT NULL)
+                 FROM timeline",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+        assert_eq!(dashes, 0, "'-' must not survive into the database");
+        assert_eq!(failures, 1, "IS NOT NULL must mean 'the call failed'");
+        // The empty-string placeholder is the same absence and must map to the same NULL.
+        let empty_users: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM timeline WHERE UserName IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_users, 1);
+    }
+
+    /// P3: temporal and severity columns carry real types, so range filters and severity ordering
+    /// do not depend on the rendering happening to sort lexicographically.
+    #[test]
+    fn duckdb_sink_types_timestamp_and_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[
+                aws_row("2024-01-01 00:00:00", "low", "-", "a", "e1", "-"),
+                aws_row("2024-03-01 12:30:00", "critical", "-", "b", "e2", "-"),
+                aws_row("not-a-timestamp", "informational", "-", "c", "e3", "-"),
+            ],
+        );
+
+        let types: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT column_name, data_type FROM duckdb_columns()
+                     WHERE table_name = 'timeline' AND column_name IN ('Timestamp', 'Level')",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let timestamp_type = &types.iter().find(|(c, _)| c == "Timestamp").unwrap().1;
+        assert_eq!(timestamp_type, "TIMESTAMP");
+        let level_type = &types.iter().find(|(c, _)| c == "Level").unwrap().1;
+        assert!(level_type.starts_with("ENUM"), "got: {level_type}");
+
+        // A range filter is a real temporal comparison, not string prefix luck.
+        let in_range: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM timeline
+                 WHERE Timestamp BETWEEN TIMESTAMP '2024-02-01' AND TIMESTAMP '2024-04-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_range, 1);
+        // Severity order lives in the type: 'critical' outranks 'low' even though it sorts before
+        // it alphabetically.
+        let worst: String = conn
+            .query_row("SELECT max(Level)::VARCHAR FROM timeline", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(worst, "critical");
+        // The type is named, which is what makes a severity threshold expressible: an ENUM
+        // compared against a bare literal falls back to text comparison, where 'informational'
+        // would count as ">= high".
+        let at_least_high: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM timeline WHERE Level >= 'high'::suzaku_level",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(at_least_high, 1, "only the 'critical' row is >= high");
+        // One unparseable timestamp degrades to NULL instead of failing the whole write.
+        let unparseable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM timeline WHERE Timestamp IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unparseable, 1);
+    }
+
+    /// P4: byte-identical rows carry no information but inflate every count derived from the file.
+    /// They are dropped, and how many were dropped is reported rather than hidden.
+    #[test]
+    fn duckdb_sink_drops_exact_duplicate_rows_and_reports_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let dup = aws_row("2024-01-01 00:00:00", "high", "-", "alice", "e1", "-");
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[
+                dup.clone(),
+                dup.clone(),
+                dup,
+                aws_row("2024-01-02 00:00:00", "high", "-", "bob", "e2", "-"),
+            ],
+        );
+
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM timeline", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let (rows, removed): (i64, i64) = conn
+            .query_row(
+                "SELECT output_rows, duplicate_rows_removed FROM suzaku_meta",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(removed, 2);
+    }
+
+    /// P5: tactics and technique IDs share one delimiter-packed column today, so a consumer has to
+    /// split on a non-ASCII separator and then guess which entries are techniques.
+    #[test]
+    fn duckdb_sink_splits_tags_into_typed_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[
+                aws_row(
+                    "2024-01-01 00:00:00",
+                    "high",
+                    "-",
+                    "alice",
+                    "e1",
+                    "PrivEsc ¦ InitAccess ¦ T1078.004 ¦ G0035",
+                ),
+                aws_row("2024-01-02 00:00:00", "high", "-", "bob", "e2", "-"),
+            ],
+        );
+
+        // `Tags` is gone; the three typed lists replace it.
+        let tags_column: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_columns()
+                 WHERE table_name = 'timeline' AND column_name = 'Tags'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags_column, 0);
+
+        let (tactics, techniques, other): (String, String, String) = conn
+            .query_row(
+                "SELECT list_aggregate(Tactics, 'string_agg', ','),
+                        list_aggregate(TechniqueIDs, 'string_agg', ','),
+                        list_aggregate(OtherTags, 'string_agg', ',')
+                 FROM timeline WHERE UserName = 'alice'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tactics, "PrivEsc,InitAccess");
+        assert_eq!(techniques, "T1078.004");
+        assert_eq!(other, "G0035", "group tags are kept, just not as tactics");
+
+        // Technique coverage is now one unnest, with no "starts with T" heuristic.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM timeline WHERE list_contains(TechniqueIDs, 'T1078.004')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+        // An untagged rule yields empty lists, never a one-element list holding the placeholder.
+        let empty: i64 = conn
+            .query_row(
+                "SELECT len(Tactics) + len(TechniqueIDs) + len(OtherTags)
+                 FROM timeline WHERE UserName = 'bob'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty, 0);
+    }
+
+    /// P1: the file says what produced it, so a consumer looks the command up instead of
+    /// inferring it from which tables happen to exist.
+    #[test]
+    fn duckdb_sink_writes_self_describing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let mut sink = DuckDbSink::new(
+            &path,
+            &keys,
+            SuzakuMeta::new("aws-ct-timeline").with_localtime(false),
+        )
+        .unwrap();
+        sink.meta.scanned_files = Some(7);
+        sink.meta.scanned_events = Some(1234);
+        sink.append_row(&aws_row("2024-01-01 00:00:00", "high", "-", "a", "e1", "-"));
+        sink.finalize().unwrap();
+        drop(sink);
+
+        let conn = Connection::open(&path).unwrap();
+        let (schema_version, command, tz, files, events): (i32, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT schema_version, command, timestamp_tz, scanned_files, scanned_events
+                 FROM suzaku_meta",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(schema_version, duckdb_out::SCHEMA_VERSION);
+        assert_eq!(command, "aws-ct-timeline");
+        assert_eq!(tz, "UTC");
+        assert_eq!(files, 7);
+        assert_eq!(events, 1234);
+
+        // P9: the row grain is recorded in the file, not only in the docs.
+        let grain: String = conn
+            .query_row(
+                "SELECT comment FROM duckdb_tables() WHERE table_name = 'timeline'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(grain.contains("rule match"), "got: {grain}");
+    }
+
+    /// P10: a database left with an unreplayed WAL cannot be opened from a read-only mount, which
+    /// is how dashboards attach the evidence file.
+    #[test]
+    fn duckdb_sink_leaves_no_wal_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[aws_row("2024-01-01 00:00:00", "high", "-", "a", "e1", "-")],
+        );
+        drop(conn);
+
+        let wal = dir.path().join("t.duckdb.wal");
+        assert!(
+            !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
+            "the checkpoint on exit must leave no work in the WAL"
+        );
+        // And the file really is readable read-only, with no writer around.
+        let cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .unwrap();
+        let ro = Connection::open_with_flags(&path, cfg).unwrap();
+        assert_eq!(
+            ro.query_row("SELECT count(*) FROM timeline", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn classify_tag_separates_tactics_techniques_and_the_rest() {
+        assert_eq!(classify_tag("PrivEsc"), TagKind::Tactic);
+        assert_eq!(classify_tag("CredAccess"), TagKind::Tactic);
+        assert_eq!(classify_tag("T1078.004"), TagKind::Technique);
+        assert_eq!(classify_tag("T1110"), TagKind::Technique);
+        assert_eq!(classify_tag("G0035"), TagKind::Other);
+        assert_eq!(classify_tag("cve.2021.1234"), TagKind::Other);
+        // A tactic abbreviation starting with T must not be mistaken for a technique.
+        assert_eq!(classify_tag("Trans"), TagKind::Other);
+    }
+
+    #[test]
+    fn split_tags_buckets_a_packed_value() {
+        let [tactics, techniques, other] = split_tags("PrivEsc ¦ T1078.004 ¦ G0035");
+        assert_eq!(tactics, "PrivEsc");
+        assert_eq!(techniques, "T1078.004");
+        assert_eq!(other, "G0035");
+        // The placeholder is an absence, not a tag.
+        assert_eq!(split_tags("-"), ["", "", ""]);
+    }
+
+    #[test]
+    fn duckdb_column_name_removes_the_hyphen() {
+        assert_eq!(duckdb_column_name("AWS-Region"), "AwsRegion");
+        assert_eq!(duckdb_column_name("EventName"), "EventName");
     }
 
     /// Rows are buffered and written per batch, so every row must survive both an automatic
@@ -1205,11 +1793,12 @@ mod tests {
         let cols = vec!["Timestamp".to_string(), "RuleTitle".to_string()];
         let rows = DUCKDB_BATCH_ROWS + 7;
 
-        let mut sink = DuckDbSink::new(&path, &cols).unwrap();
+        let mut sink = DuckDbSink::new(&path, &cols, SuzakuMeta::new("aws-ct-timeline")).unwrap();
         for i in 0..rows {
-            sink.append_row(&[format!("2024-01-01T00:00:{i}"), format!("Rule {i}")]);
+            // Distinct timestamps as well as titles, so the dedup pass cannot mask a lost row.
+            sink.append_row(&[format!("2024-01-01 00:00:00.{i:06}"), format!("Rule {i}")]);
         }
-        sink.flush();
+        sink.finalize().unwrap();
         drop(sink);
 
         let conn = Connection::open(&path).unwrap();
@@ -1261,7 +1850,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.duckdb");
         let profile = vec![("Timestamp".to_string(), ".eventTime".to_string())];
-        let sink = DuckDbSink::new(&path, &["Timestamp".to_string()]).unwrap();
+        let sink = DuckDbSink::new(
+            &path,
+            &["Timestamp".to_string()],
+            SuzakuMeta::new("aws-ct-timeline"),
+        )
+        .unwrap();
         // Opening the sink creates the database file.
         assert!(path.exists());
 
