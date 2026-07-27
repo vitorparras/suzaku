@@ -221,23 +221,42 @@ impl DuckDbSink {
     /// Write the buffered rows and clear the buffer. The appender is created per batch rather than
     /// held in the struct because `Connection::appender` borrows the connection, which a
     /// self-referential field cannot express; recreating it costs ~1% of the batch write.
+    ///
+    /// A failure does not abort the scan — the other output formats are already written and the
+    /// staged rows are still worth typing — but the batch is lost, so it is logged with the number
+    /// of rows at stake instead of leaving the user with a quietly short database. Dropping the
+    /// batch rather than holding it for a retry is what keeps memory bounded when a failure
+    /// persists.
     fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
         }
-        // Errors shouldn't abort the whole scan; drop the batch (rare — the staging schema is
-        // fixed and every value is a string).
-        if let Ok(mut appender) =
-            self.conn
-                .appender_to_catalog_and_db(DUCKDB_STAGING_TABLE, "temp", "main")
-        {
-            for row in &self.pending {
-                let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
-                let _ = appender.append_row(params.as_slice());
-            }
-            let _ = appender.flush();
+        if let Err(e) = self.append_pending() {
+            log_error(&format!(
+                "{e} Up to {} row(s) are missing from the DuckDB output.",
+                self.pending.len()
+            ));
         }
         self.pending.clear();
+    }
+
+    /// Append the buffered rows to the staging table, stopping at the first failure. Rows already
+    /// handed to the appender may still land, which is why the caller reports its count as an
+    /// upper bound on what was lost.
+    fn append_pending(&self) -> Result<(), String> {
+        let mut appender = self
+            .conn
+            .appender_to_catalog_and_db(DUCKDB_STAGING_TABLE, "temp", "main")
+            .map_err(|e| format!("Cannot open the DuckDB staging appender: {e}."))?;
+        for row in &self.pending {
+            let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
+            appender
+                .append_row(params.as_slice())
+                .map_err(|e| format!("Cannot stage a row for the DuckDB timeline table: {e}."))?;
+        }
+        appender
+            .flush()
+            .map_err(|e| format!("Cannot stage rows for the DuckDB timeline table: {e}."))
     }
 
     /// The `SELECT` expression producing one final column from its staging counterpart.
