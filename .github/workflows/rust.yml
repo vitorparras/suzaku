@@ -63,10 +63,12 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Fmt Check
         run: cargo fmt -- --check
-      - name: Prepare Clippy
-        run: rustup component add clippy
+      # `--target` must match the "Build tests"/"Run tests" steps below. Without it clippy
+      # builds into `target/debug` while those build into `target/<triple>/debug`, so the
+      # bundled DuckDB C++ engine gets compiled once per directory and the cache ends up
+      # holding two full copies of every artifact.
       - name: Run clippy action to produce annotations
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --target=${{ matrix.info.target }} -- -D warnings
       - name: Install dependencies for musl
         if: matrix.info.os == 'ubuntu-latest' && matrix.info.cross == true
         run: |
