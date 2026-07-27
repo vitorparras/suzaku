@@ -42,7 +42,7 @@ jobs:
         run: cd main && cargo run --release -- aws-ct-metrics -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q
 
       - name: aws-ct-metrics(-o)
-        run: cd main && cargo run --release -- aws-ct-metrics -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q -o metrics.csv
+        run: cd main && cargo run --release -- aws-ct-metrics -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q -o metrics -t csv,json,jsonl,duckdb
 
       - name: aws-ct-summary(-o)
         run: cd main && cargo run --release -- aws-ct-summary -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q -o summary -t csv,json,jsonl,duckdb

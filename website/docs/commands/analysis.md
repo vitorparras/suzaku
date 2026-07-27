@@ -68,4 +68,27 @@ File output is a single flat table with a `Field` column, so all fields end up i
 | sourceIPAddress | 203.0.113.10 | 1,024 | 62.19% | 2021-07-05 13:03:12 | 2021-07-05 13:03:50 | Example ISP | London | United Kingdom |
 
 The `SrcASN`, `SrcCity` and `SrcCountry` columns only appear when `-G` is used, and only values that parse as an IP address are enriched (an AWS-service caller such as `cloudtrail.amazonaws.com` shows `-`).
-The DuckDB output is a single `metrics` table, so `SELECT * FROM metrics WHERE Field = 'sourceIPAddress' ORDER BY Count` works directly.
+
+The DuckDB output is a single `metrics` table plus the [`suzaku_meta`](dfir-timeline.md#duckdb-output-schema) provenance table, so `SELECT * FROM metrics WHERE Field = 'sourceIPAddress' ORDER BY Count DESC` works directly. Values there are typed rather than rendered, and the table carries two columns the text formats do not:
+
+| Column | Type | Notes |
+|---|---|---|
+| `Field` | `VARCHAR` | The CloudTrail field path, exactly as given to `-F` |
+| `TimelineColumn` | `VARCHAR` | The `aws-ct-timeline` column holding the same fact (`sourceIPAddress` → `SrcIP`), or `NULL` when there is none |
+| `Value` | `VARCHAR` | `NULL` when the event carried no value for `Field` |
+| `Count` | `BIGINT` | |
+| `FieldTotal` | `BIGINT` | Events counted for this `Field`, i.e. the denominator of `Percent` |
+| `Percent` | `DOUBLE` | `Count / FieldTotal`, at full precision — unlike the `62.19%` the CSV renders, this sums back to 100 per field |
+| `FirstSeen` / `LastSeen` | `TIMESTAMP` | |
+| `SrcASN` / `SrcCity` / `SrcCountry` | `VARCHAR` | Present only when `-G` is used |
+
+So the exact share of a value is a query rather than a re-aggregation of rounded percentages:
+
+```sql
+SELECT Value, Count, Count * 100.0 / FieldTotal AS pct
+FROM metrics
+WHERE Field = 'sourceIPAddress' AND Value IS NOT NULL
+ORDER BY Count DESC LIMIT 10;
+```
+
+`TimelineColumn` is read from `config/aws_profile.yaml`; run the command from the directory containing `config/` or the column is `NULL` for every row.

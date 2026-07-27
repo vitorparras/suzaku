@@ -134,7 +134,10 @@ const TAG_COLUMNS: [&str; 3] = ["Tactics", "TechniqueIDs", "OtherTags"];
 /// The only rewrite today is `AWS-Region` -> `AwsRegion`. A hyphen makes the identifier illegal
 /// unquoted, so every consumer — and every piece of ad-hoc or generated SQL — has to remember to
 /// double-quote it forever, which is a cost paid on every query to save one character here.
-fn duckdb_column_name(profile_key: &str) -> String {
+///
+/// Shared with `aws-ct-metrics`, which names the timeline column a metric aggregates so the two
+/// commands cannot end up spelling the same fact differently.
+pub fn duckdb_column_name(profile_key: &str) -> String {
     match profile_key {
         "AWS-Region" => "AwsRegion".to_string(),
         other => other.replace('-', ""),
