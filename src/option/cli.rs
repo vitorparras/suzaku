@@ -1,3 +1,4 @@
+use crate::option::ct_fields::parse_field_name;
 use crate::option::timefiler::parse_offset;
 use chrono::{DateTime, NaiveDate};
 use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -175,6 +176,38 @@ pub struct InputOption {
 }
 
 #[derive(Args, Clone, Debug, Default)]
+pub struct MetricsOptions {
+    #[clap(flatten)]
+    pub input_opt: InputOption,
+
+    /// Include temporary AWS STS access key IDs
+    #[arg(help_heading = Some("Filtering"), short = 's', long = "include-sts-keys", display_order = 204)]
+    pub include_sts: bool,
+
+    /// The field(s) to generate metrics for. Comma-separate or repeat to aggregate several
+    /// in a single scan, e.g. -F sourceIPAddress,userAgent
+    #[arg(help_heading = Some("Output"), short = 'F', long = "field-name", value_delimiter = ',', default_value = "eventName", value_parser = parse_field_name, value_name = "FIELD_NAME,...", display_order = 300)]
+    pub field_names: Vec<String>,
+
+    /// Overwrite files when saving
+    #[arg(help_heading = Some("Output"), short = 'C', long = "clobber", requires = "output", display_order = 301)]
+    pub clobber: bool,
+
+    /// Add GeoIP (ASN, city, country) info to IP addresses
+    #[arg(help_heading = Some("Output"), short = 'G', long = "geo-ip", visible_alias = "GeoIP", value_name = "MAXMIND-DB-DIR", display_order = 302)]
+    pub geo_ip: Option<PathBuf>,
+
+    /// Save the results to a file
+    #[arg(help_heading = Some("Output"), short, long, value_name = "FILE", display_order = 303)]
+    pub output: Option<PathBuf>,
+
+    /// Output format(s) (only used with -o): csv (default), json, jsonl, duckdb. Comma-separate
+    /// or repeat to write several at once, e.g. -t csv,duckdb
+    #[arg(help_heading = Some("Output"), short = 't', long = "output-type", value_enum, value_delimiter = ',', default_value = "csv", value_name = "FORMAT,...", display_order = 304)]
+    pub output_types: Vec<OutputFormat>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
 pub struct TimelineOptions {
     /// Specify a custom rule directory or file (default: ./rules)
     #[arg(help_heading = Some("General Options"), short = 'r', long, default_value = "./rules", hide_default_value = true, value_name = "DIR/FILE", display_order = 11)]
@@ -243,21 +276,7 @@ pub enum Commands {
     /// Generates metrics from AWS CloudTrail logs
     AwsCtMetrics {
         #[clap(flatten)]
-        input_opt: InputOption,
-
-        /// The field to generate metrics for
-        #[arg(
-            help_heading = Some("Output"),
-            short = 'F',
-            default_value = "eventName",
-            long,
-            value_name = "FIELD_NAME"
-        )]
-        field_name: String,
-
-        /// Output CSV
-        #[arg(help_heading = Some("Output"), short, long, value_name = "FILE")]
-        output: Option<PathBuf>,
+        options: MetricsOptions,
 
         #[clap(flatten)]
         common_opt: CommonOptions,

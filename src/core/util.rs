@@ -4,6 +4,7 @@ use crate::core::log_source::LogSource;
 use crate::option::geoip::GeoIPSearch;
 use bytesize::ByteSize;
 use csv::Writer;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -157,6 +158,28 @@ pub fn set_rayon_threat_number(val: usize) {
         .num_threads(val)
         .build_global()
         .unwrap();
+}
+
+/// Insert or update a per-key `(count, first_seen, last_seen)` entry, tracking the first/last
+/// event time seen for THAT key. Shared by `aws-ct-summary` and `aws-ct-metrics` so both report
+/// the same per-value time window. Times are compared as strings, which is correct for the
+/// RFC 3339 UTC timestamps CloudTrail writes (`2024-01-02T03:04:05Z`) because they are fixed
+/// width and lexicographically ordered.
+pub fn upsert_count_entry(
+    map: &mut HashMap<String, (usize, String, String)>,
+    key: String,
+    event_time: &str,
+) {
+    let entry = map
+        .entry(key)
+        .or_insert_with(|| (0, event_time.to_string(), event_time.to_string()));
+    entry.0 += 1;
+    if event_time < entry.1.as_str() {
+        entry.1 = event_time.to_string();
+    }
+    if event_time > entry.2.as_str() {
+        entry.2 = event_time.to_string();
+    }
 }
 
 pub fn load_profile(

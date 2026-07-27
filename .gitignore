@@ -21,3 +21,4 @@ suzaku*
 /website/site/
 !/website/docs/stylesheets/
 !/website/docs/stylesheets/extra.css
+*.duckdb

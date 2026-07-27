@@ -24,6 +24,8 @@ After you found any suspicious API calls being called, source IP addresses or us
 
 > Warning: there will be a lot of data in the cells and will most likely not display well in programs like Excel. Please use Numbers on a Mac, Timeline Explorer on Windows, etc...
 
+> See also: this command breaks the information down **per user ARN**. To see the same fields (source IPs, user agents, regions, access key IDs, ...) aggregated **across all events**, with one row per value that you can sort and filter, use the [`aws-ct-metrics` command](analysis.md).
+
 ### `AbusedAPIs-Success` example:
 ```
 Unique APIs: 11 | Total APIs 477,373

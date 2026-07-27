@@ -4,7 +4,7 @@ use crate::core::log_source::LogSource;
 use crate::core::scan::{load_aws_events_from_file, process_events_from_dir};
 use crate::core::timeline_writer::resolve_output_targets;
 use crate::core::util::{
-    error_msg, fatal_error, get_writer, output_path_info, p, sanitize_csv_field,
+    error_msg, fatal_error, get_writer, output_path_info, p, sanitize_csv_field, upsert_count_entry,
 };
 use crate::option::cli::{InputOption, OutputFormat};
 use crate::option::geoip::GeoIPSearch;
@@ -80,27 +80,6 @@ struct CTSummary {
 }
 
 impl CTSummary {
-    /// Insert or update a per-key `(count, first_seen, last_seen)` entry, tracking
-    /// the first/last event time seen for THAT key. These tuples were previously
-    /// seeded once from the dataset-global min/max at insertion time and never
-    /// updated, so every per-entry time window in the summary was wrong.
-    fn upsert_count_entry(
-        map: &mut HashMap<String, (usize, String, String)>,
-        key: String,
-        event_time: &str,
-    ) {
-        let entry = map
-            .entry(key)
-            .or_insert_with(|| (0, event_time.to_string(), event_time.to_string()));
-        entry.0 += 1;
-        if event_time < entry.1.as_str() {
-            entry.1 = event_time.to_string();
-        }
-        if event_time > entry.2.as_str() {
-            entry.2 = event_time.to_string();
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn add_event(
         &mut self,
@@ -124,27 +103,27 @@ impl CTSummary {
             self.last_timestamp = event_time.clone();
         }
 
-        Self::upsert_count_entry(&mut self.aws_regions, aws_region, &event_time);
-        Self::upsert_count_entry(&mut self.src_ips, source_ip, &event_time);
+        upsert_count_entry(&mut self.aws_regions, aws_region, &event_time);
+        upsert_count_entry(&mut self.src_ips, source_ip, &event_time);
         self.user_types = user_type;
-        Self::upsert_count_entry(&mut self.access_key_ids, access_key_id, &event_time);
-        Self::upsert_count_entry(&mut self.user_agents, user_agent, &event_time);
+        upsert_count_entry(&mut self.access_key_ids, access_key_id, &event_time);
+        upsert_count_entry(&mut self.user_agents, user_agent, &event_time);
 
         if !abused_api_success.is_empty() {
-            Self::upsert_count_entry(
+            upsert_count_entry(
                 &mut self.abused_api_success,
                 abused_api_success,
                 &event_time,
             );
         }
         if !abused_api_failed.is_empty() {
-            Self::upsert_count_entry(&mut self.abused_api_failed, abused_api_failed, &event_time);
+            upsert_count_entry(&mut self.abused_api_failed, abused_api_failed, &event_time);
         }
         if !other_api_success.is_empty() {
-            Self::upsert_count_entry(&mut self.other_api_success, other_api_success, &event_time);
+            upsert_count_entry(&mut self.other_api_success, other_api_success, &event_time);
         }
         if !other_api_failed.is_empty() {
-            Self::upsert_count_entry(&mut self.other_api_failed, other_api_failed, &event_time);
+            upsert_count_entry(&mut self.other_api_failed, other_api_failed, &event_time);
         }
     }
 }
@@ -1499,9 +1478,9 @@ mod tests {
     fn upsert_count_entry_tracks_per_key_time_range() {
         let mut m: HashMap<String, (usize, String, String)> = HashMap::new();
         // Same key seen at T1, then T3, then T2 (out of order).
-        CTSummary::upsert_count_entry(&mut m, "us-east-1".to_string(), "2024-01-01T00:00:00Z");
-        CTSummary::upsert_count_entry(&mut m, "us-east-1".to_string(), "2024-01-03T00:00:00Z");
-        CTSummary::upsert_count_entry(&mut m, "us-east-1".to_string(), "2024-01-02T00:00:00Z");
+        upsert_count_entry(&mut m, "us-east-1".to_string(), "2024-01-01T00:00:00Z");
+        upsert_count_entry(&mut m, "us-east-1".to_string(), "2024-01-03T00:00:00Z");
+        upsert_count_entry(&mut m, "us-east-1".to_string(), "2024-01-02T00:00:00Z");
         let e = &m["us-east-1"];
         assert_eq!(e.0, 3, "count");
         // first_seen/last_seen reflect THIS key's own earliest/latest event,
