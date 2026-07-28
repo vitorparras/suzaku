@@ -1,8 +1,8 @@
 use crate::core::color::SuzakuColor;
 use crate::core::color::SuzakuColor::{Green, Orange, Red, White, Yellow};
 use crate::core::duckdb_out::{
-    self, LEVEL_TYPE, MULTI_VALUE_SEPARATOR, SuzakuMeta, list_expr, nullable, quote_ident,
-    timestamp_expr,
+    self, GEO_COLUMN_COMMENT, GEO_COLUMNS, LEVEL_TYPE, MULTI_VALUE_SEPARATOR, SuzakuMeta,
+    list_expr, nullable, quote_ident, timestamp_expr,
 };
 use crate::core::errorlog::log_error;
 use crate::core::util::{get_json_writer, get_writer, sanitize_csv_field};
@@ -165,6 +165,10 @@ struct DuckDbSink {
     columns: Vec<String>,
     /// Index of the `Tags` value inside an incoming record, when the profile has one.
     tags_index: Option<usize>,
+    /// Where to splice the empty [`GEO_COLUMNS`] cells into a record, when the profile has a
+    /// `SrcIP` but no geo columns because `-G` was not given. An index into the final column list,
+    /// so it is applied after the `Tags` expansion has already shifted the row.
+    geo_fill_at: Option<usize>,
     /// Rows accumulated since the last flush, drained into an `Appender` by [`Self::flush`].
     pending: Vec<Vec<String>>,
     /// Provenance written to `suzaku_meta` by [`Self::finalize`].
@@ -183,6 +187,19 @@ impl DuckDbSink {
             }
         }
 
+        // Without `-G` the profile carries no geo keys, but the table still gets the columns —
+        // all-NULL — so that one query works against every file this command writes. They are
+        // enrichment *of* `SrcIP`, so a profile without one has nothing to describe and gets
+        // nothing; `suzaku_meta.geoip_enabled` records which case a NULL came from.
+        let geo_fill_at = match columns.iter().position(|c| c == "SrcIP") {
+            Some(i) if !columns.iter().any(|c| c == GEO_COLUMNS[0]) => {
+                let at = i + 1;
+                columns.splice(at..at, GEO_COLUMNS.iter().map(|c| c.to_string()));
+                Some(at)
+            }
+            _ => None,
+        };
+
         let conn = Connection::open(path)
             .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
         let cols_ddl = columns
@@ -198,13 +215,14 @@ impl DuckDbSink {
             conn,
             columns,
             tags_index,
+            geo_fill_at,
             pending: Vec::with_capacity(DUCKDB_BATCH_ROWS),
             meta,
         })
     }
 
     fn append_row(&mut self, record: &[String]) {
-        let row = match self.tags_index {
+        let mut row = match self.tags_index {
             // Expand the packed tag string in place, keeping every other column where it was.
             Some(i) if i < record.len() => {
                 let mut row = Vec::with_capacity(self.columns.len());
@@ -215,6 +233,13 @@ impl DuckDbSink {
             }
             _ => record.to_vec(),
         };
+        // After the tag expansion, so the recorded column-space index lines up whether `Tags`
+        // comes before or after `SrcIP` in the profile.
+        if let Some(at) = self.geo_fill_at
+            && at <= row.len()
+        {
+            row.splice(at..at, GEO_COLUMNS.iter().map(|_| String::new()));
+        }
         self.pending.push(row);
         if self.pending.len() >= DUCKDB_BATCH_ROWS {
             self.flush();
@@ -334,6 +359,9 @@ impl DuckDbSink {
                 "OtherTags",
                 "Rule tags that are neither a tactic nor a technique (e.g. ATT&CK groups, CVEs).",
             ),
+            (GEO_COLUMNS[0], GEO_COLUMN_COMMENT),
+            (GEO_COLUMNS[1], GEO_COLUMN_COMMENT),
+            (GEO_COLUMNS[2], GEO_COLUMN_COMMENT),
         ] {
             if self.columns.iter().any(|c| c == column) {
                 duckdb_out::comment_on_column(&self.conn, "timeline", column, comment)?;
@@ -1700,6 +1728,144 @@ mod tests {
             )
             .unwrap();
         assert_eq!(empty, 0);
+    }
+
+    /// The profile a run produces: `SrcIP` plus, under `-G` only, the three geo keys after it.
+    fn profile_keys_with_src_ip(geo: bool) -> Vec<String> {
+        let mut keys = vec![
+            "Timestamp".to_string(),
+            "SrcIP".to_string(),
+            "UserName".to_string(),
+            "Tags".to_string(),
+        ];
+        if geo {
+            keys.splice(2..2, GEO_COLUMNS.iter().map(|c| c.to_string()));
+        }
+        keys
+    }
+
+    fn timeline_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM duckdb_columns()
+                 WHERE table_name = 'timeline' ORDER BY column_index",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// P8: without `-G` the geo columns are still part of the table, all NULL. A column that comes
+    /// and goes with a run-time flag makes one query a binder error on half the files.
+    #[test]
+    fn duckdb_sink_adds_null_geo_columns_without_geoip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = profile_keys_with_src_ip(false);
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[vec![
+                "2024-01-01 00:00:00".to_string(),
+                "81.2.69.142".to_string(),
+                "alice".to_string(),
+                "PrivEsc".to_string(),
+            ]],
+        );
+
+        // The geo columns sit where enrichment would have put them, right after SrcIP, and the
+        // Tags expansion still lands on the columns it belongs to.
+        assert_eq!(
+            timeline_columns(&conn),
+            [
+                "Timestamp",
+                "SrcIP",
+                "SrcASN",
+                "SrcCity",
+                "SrcCountry",
+                "UserName",
+                "Tactics",
+                "TechniqueIDs",
+                "OtherTags",
+            ]
+        );
+        let (nulls, ip, tactics): (i64, String, String) = conn
+            .query_row(
+                "SELECT count(*) FILTER (WHERE SrcASN IS NULL AND SrcCity IS NULL
+                                            AND SrcCountry IS NULL),
+                        any_value(SrcIP),
+                        any_value(list_aggregate(Tactics, 'string_agg', ','))
+                 FROM timeline",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+        assert_eq!(ip, "81.2.69.142");
+        assert_eq!(tactics, "PrivEsc");
+    }
+
+    /// With `-G` the profile already carries the geo keys, so the filler must not add a second set
+    /// and the enriched values must stay in their own columns.
+    #[test]
+    fn duckdb_sink_keeps_enriched_geo_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = profile_keys_with_src_ip(true);
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[vec![
+                "2024-01-01 00:00:00".to_string(),
+                "81.2.69.142".to_string(),
+                "AS1234".to_string(),
+                "London".to_string(),
+                "United Kingdom".to_string(),
+                "alice".to_string(),
+                "-".to_string(),
+            ]],
+        );
+
+        assert_eq!(
+            timeline_columns(&conn),
+            [
+                "Timestamp",
+                "SrcIP",
+                "SrcASN",
+                "SrcCity",
+                "SrcCountry",
+                "UserName",
+                "Tactics",
+                "TechniqueIDs",
+                "OtherTags",
+            ]
+        );
+        let (city, country, user): (String, String, String) = conn
+            .query_row(
+                "SELECT SrcCity, SrcCountry, UserName FROM timeline",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(city, "London");
+        assert_eq!(country, "United Kingdom");
+        assert_eq!(user, "alice");
+    }
+
+    /// The geo columns describe `SrcIP`, so a profile without one gets nothing to describe.
+    #[test]
+    fn duckdb_sink_omits_geo_columns_when_the_profile_has_no_src_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let keys = aws_profile_keys();
+        let conn = finalized_sink(
+            &path,
+            &keys,
+            &[aws_row("2024-01-01 00:00:00", "high", "-", "a", "e1", "-")],
+        );
+        assert!(!timeline_columns(&conn).iter().any(|c| c == "SrcCountry"));
     }
 
     /// P1: the file says what produced it, so a consumer looks the command up instead of

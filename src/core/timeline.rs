@@ -120,6 +120,7 @@ pub fn make_timeline(options: &TimelineOptions, common_opt: &CommonOptions, log:
     // report has to be able to cite these, and today they are unknowable from the file.
     let meta = SuzakuMeta::new(log.command_name())
         .with_localtime(options.localtime)
+        .with_geoip(geo_search.is_some())
         .with_rules(&options.rules, rules.len() + total_correlation_rules);
     let (writers, output_pathes) = init_writers(
         options.output_opt.output.as_ref(),

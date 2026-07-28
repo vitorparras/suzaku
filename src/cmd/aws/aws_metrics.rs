@@ -488,8 +488,10 @@ fn timeline_column_map() -> HashMap<String, String> {
 /// are `TIMESTAMP`, a missing value is `NULL` rather than the text placeholder, and `Percent` is
 /// stored at full precision alongside the `FieldTotal` it was derived from — the CSV's two-decimal
 /// rendering makes `sum(Percent)` 99.03 instead of 100, and the denominator needed to recompute it
-/// is per field, so it cannot live in `suzaku_meta`. The GeoIP columns exist only when `--geo-ip`
-/// ran, so an all-NULL column never has to be told apart from enrichment that found nothing.
+/// is per field, so it cannot live in `suzaku_meta`. The GeoIP columns are always present, unlike
+/// in the CSV output — a column that comes and goes with `-G` turns one query into a binder error
+/// on half the files — and `suzaku_meta.geoip_enabled` says whether they are NULL because
+/// enrichment was off or because the value was not an IP.
 fn write_duckdb_metrics(
     path: &Path,
     records: &[MetricRecord],
@@ -515,9 +517,10 @@ fn write_duckdb_metrics(
             record.first_seen.clone(),
             record.last_seen.clone(),
         ];
-        if geo_enabled {
-            row.extend(record.geo_cells());
-        }
+        // Unenriched cells are the `-` placeholder here and `NULL` in the table: `geo_cells`
+        // already renders an absent value that way, whether it is absent because `-G` was not
+        // given or because the value is not an IP address.
+        row.extend(record.geo_cells());
         rows.push(row);
     }
 
@@ -535,7 +538,7 @@ fn write_duckdb_metrics(
          FirstSeen TIMESTAMP,
          LastSeen TIMESTAMP",
     );
-    let mut columns = vec![
+    let mut columns: Vec<(&str, String)> = vec![
         ("Field", raw("Field")),
         ("TimelineColumn", text("TimelineColumn")),
         ("Value", text("Value")),
@@ -545,22 +548,13 @@ fn write_duckdb_metrics(
         ("FirstSeen", timestamp_expr(&quote_ident("FirstSeen"))),
         ("LastSeen", timestamp_expr(&quote_ident("LastSeen"))),
     ];
-    if geo_enabled {
-        ddl.push_str(
-            ",
-         SrcASN VARCHAR,
-         SrcCity VARCHAR,
-         SrcCountry VARCHAR",
-        );
-        columns.extend([
-            ("SrcASN", text("SrcASN")),
-            ("SrcCity", text("SrcCity")),
-            ("SrcCountry", text("SrcCountry")),
-        ]);
+    for column in duckdb_out::GEO_COLUMNS {
+        ddl.push_str(&format!(",\n         {column} VARCHAR"));
+        columns.push((column, text(column)));
     }
     duckdb_out::stage_and_type(&conn, "metrics", &ddl, &columns, &rows)?;
 
-    let mut meta = SuzakuMeta::new("aws-ct-metrics");
+    let mut meta = SuzakuMeta::new("aws-ct-metrics").with_geoip(geo_enabled);
     meta.scanned_files = Some(scan.files as i64);
     meta.scanned_events = Some(scan.events as i64);
     meta.output_rows = Some(records.len() as i64);
@@ -572,6 +566,9 @@ fn write_duckdb_metrics(
          counted for its Field; events that carried no value for the field are counted too, under \
          Value IS NULL. Rows are an aggregation, so (Field, Value) is unique.",
     )?;
+    for column in duckdb_out::GEO_COLUMNS {
+        duckdb_out::comment_on_column(&conn, "metrics", column, duckdb_out::GEO_COLUMN_COMMENT)?;
+    }
     duckdb_out::checkpoint(&conn)
 }
 
@@ -924,11 +921,22 @@ mod tests {
         assert_eq!(column, None);
     }
 
-    /// P8: all-NULL geo columns read as broken enrichment, so they only exist when it ran.
+    /// P8: the geo columns are part of the schema whether or not `-G` ran, so one query works
+    /// against every file. `suzaku_meta.geoip_enabled` is what says why they are NULL.
     #[test]
-    fn duckdb_metrics_omits_geo_columns_without_the_flag() {
+    fn duckdb_metrics_always_has_geo_columns() {
         let (_tmp, conn) = duckdb_of(&["sourceIPAddress"], None);
-        assert_eq!(column_type(&conn, "SrcCountry"), None);
+        assert_eq!(column_type(&conn, "SrcCountry").as_deref(), Some("VARCHAR"));
+        let (enriched, geoip_enabled): (i64, bool) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM metrics WHERE SrcCountry IS NOT NULL),
+                        (SELECT geoip_enabled FROM suzaku_meta)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enriched, 0);
+        assert!(!geoip_enabled);
 
         let mut geo = GeoIPSearch::new(Path::new("test_files/mmdb"))
             .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/");
@@ -937,7 +945,10 @@ mod tests {
             r#"{"eventTime":"2024-01-01T00:00:00Z","sourceIPAddress":"cloudtrail.amazonaws.com"}"#,
         ];
         let (_tmp, conn) = duckdb_of_events(&["sourceIPAddress"], &events, Some(&mut geo));
-        assert_eq!(column_type(&conn, "SrcCountry").as_deref(), Some("VARCHAR"));
+        let geoip_enabled: bool = conn
+            .query_row("SELECT geoip_enabled FROM suzaku_meta", [], |r| r.get(0))
+            .unwrap();
+        assert!(geoip_enabled);
 
         let country: Option<String> = conn
             .query_row(

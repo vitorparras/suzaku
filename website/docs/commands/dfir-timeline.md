@@ -89,6 +89,7 @@ to `aws-ct-timeline`, `azure-timeline` and `aws-ct-search`:
 | `Level` | text | `suzaku_level`, an `ENUM` ordered by severity |
 | `AWS-Region` | `AWS-Region` | `AwsRegion` (no quoting needed in SQL) |
 | `Tags` | one ` ¦ `-joined string | `Tactics`, `TechniqueIDs`, `OtherTags`, each a `VARCHAR[]` |
+| `SrcASN` / `SrcCity` / `SrcCountry` | added only under `-G, --geo-ip` | always present (when the profile has `SrcIP`), `NULL` when `-G` was not used |
 | Duplicate rows | kept | exact duplicates removed, count reported in `suzaku_meta` |
 
 Every file also carries a one-row `suzaku_meta` table so a reader can tell what produced it
@@ -101,6 +102,7 @@ without guessing:
 | `generated_at` | When the file was written. |
 | `timestamp_tz` | The zone the `Timestamp` column is expressed in — `UTC`, or the local offset under `-l, --localtime`. |
 | `rules_version`, `rules_count` | Ruleset revision (when the rules folder is a git checkout) and how many rules were loaded. |
+| `geoip_enabled` | Whether `-G, --geo-ip` ran. Tells an all-`NULL` `SrcCountry` ("enrichment was off") apart from a `NULL` cell in an enriched file ("this value is not an IP address"). |
 | `scanned_files`, `scanned_events` | Coverage of the run. |
 | `output_rows`, `duplicate_rows_removed` | Rows written, and exact duplicates dropped on write. |
 

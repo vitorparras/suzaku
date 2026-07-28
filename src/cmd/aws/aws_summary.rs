@@ -379,6 +379,7 @@ pub fn aws_summary(
             abused_aws_api_values,
             output_types,
             clobber,
+            geo_ip.is_some(),
         );
     } else if let Some(f) = file {
         let events = load_aws_events_from_file(f);
@@ -392,6 +393,7 @@ pub fn aws_summary(
                 abused_aws_api_values,
                 output_types,
                 clobber,
+                geo_ip.is_some(),
             );
         }
     }
@@ -410,6 +412,10 @@ fn output_summary(
     abused_aws_api_disc: Vec<String>,
     output_types: &[OutputFormat],
     clobber: bool,
+    // Whether -G ran. This command has no geo columns — the enrichment is appended to the SrcIP
+    // value itself — so it only reaches suzaku_meta, where it tells a consumer that those values
+    // carry an "(ASN, city, country)" suffix.
+    geo_enabled: bool,
 ) {
     if user_data.is_empty() {
         error_msg(no_color, "No events found.");
@@ -604,7 +610,7 @@ fn output_summary(
     // --- DuckDB 出力 ---
     if let Some(duckdb_path) = duckdb_path {
         let records = build_json_records(user_data, *hide_descriptions);
-        match write_duckdb_summary(&duckdb_path, &records) {
+        match write_duckdb_summary(&duckdb_path, &records, geo_enabled) {
             Ok(()) => output_paths.push(duckdb_path),
             Err(e) => fatal_error(no_color, &e),
         }
@@ -646,7 +652,11 @@ fn split_api(api: &str) -> (&str, &str) {
 /// boolean + `Outcome` enum), the `API` string into `API` + `EventSource`, and `UserTypes` into a
 /// list. `-`/empty placeholders become NULL. See `core::duckdb_out` for why the rows go through a
 /// staging table on the way in.
-fn write_duckdb_summary(path: &Path, records: &[SummaryJsonRecord]) -> Result<(), String> {
+fn write_duckdb_summary(
+    path: &Path,
+    records: &[SummaryJsonRecord],
+    geo_enabled: bool,
+) -> Result<(), String> {
     let conn = Connection::open(path)
         .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
 
@@ -791,7 +801,7 @@ fn write_duckdb_summary(path: &Path, records: &[SummaryJsonRecord]) -> Result<()
         &attr_rows,
     )?;
 
-    let mut meta = SuzakuMeta::new("aws-ct-summary");
+    let mut meta = SuzakuMeta::new("aws-ct-summary").with_geoip(geo_enabled);
     meta.output_rows = Some(records.len() as i64);
     duckdb_out::write_meta(&conn, &meta)?;
     duckdb_out::comment_on_table(&conn, "summary", "One row per principal (UserARN).")?;
@@ -1139,6 +1149,7 @@ mod tests {
             vec![],
             &[OutputFormat::Csv],
             false,
+            false,
         );
 
         assert!(tmp.path().join("result.csv").exists());
@@ -1161,6 +1172,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Json],
+            false,
             false,
         );
 
@@ -1185,6 +1197,7 @@ mod tests {
             vec![],
             &[OutputFormat::Jsonl],
             false,
+            false,
         );
 
         assert!(!tmp.path().join("result.csv").exists());
@@ -1208,6 +1221,7 @@ mod tests {
             vec![],
             &[OutputFormat::Csv, OutputFormat::Json],
             false,
+            false,
         );
 
         assert!(tmp.path().join("result.csv").exists());
@@ -1230,6 +1244,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Csv, OutputFormat::Jsonl],
+            false,
             false,
         );
 
@@ -1257,6 +1272,7 @@ mod tests {
             vec![],
             &[OutputFormat::Json],
             false,
+            false,
         );
 
         let content = std::fs::read_to_string(tmp.path().join("result.json")).unwrap();
@@ -1283,6 +1299,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Jsonl],
+            false,
             false,
         );
 
@@ -1314,6 +1331,7 @@ mod tests {
             vec![],
             &[OutputFormat::Json],
             false,
+            false,
         );
 
         // 上書きされていないこと
@@ -1341,6 +1359,7 @@ mod tests {
             vec![],
             &[OutputFormat::Csv, OutputFormat::Json],
             false,
+            false,
         );
 
         assert_eq!(std::fs::read_to_string(&json_path).unwrap(), "original");
@@ -1366,6 +1385,7 @@ mod tests {
             vec![],
             &[OutputFormat::Json],
             true,
+            false,
         );
 
         let content = std::fs::read_to_string(&json_path).unwrap();
@@ -1392,6 +1412,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Duckdb],
+            false,
             false,
         );
 
@@ -1452,6 +1473,7 @@ mod tests {
             vec![],
             &[OutputFormat::Duckdb],
             false,
+            false,
         );
 
         // The two outputs are built from the same records, so a mismatch means
@@ -1509,6 +1531,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Duckdb],
+            false,
             false,
         );
 
@@ -1587,6 +1610,7 @@ mod tests {
             vec![],
             &[OutputFormat::Duckdb],
             false,
+            false,
         );
 
         let conn = Connection::open(tmp.path().join("result.duckdb")).unwrap();
@@ -1620,6 +1644,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Duckdb],
+            false,
             false,
         );
 
@@ -1662,6 +1687,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Csv, OutputFormat::Json, OutputFormat::Duckdb],
+            false,
             false,
         );
 

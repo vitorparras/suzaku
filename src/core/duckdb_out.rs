@@ -56,6 +56,20 @@ pub const OUTCOME_ENUM: &str = "ENUM('success','failed')";
 /// values) into one column. In DuckDB those columns are split back into `VARCHAR[]`.
 pub const MULTI_VALUE_SEPARATOR: &str = " ¦ ";
 
+/// The MaxMind enrichment of a source IP, in the order every writer emits it.
+///
+/// The text outputs add these columns only under `-G`, which is right for a spreadsheet. The
+/// DuckDB output always has them: a column that appears and disappears with a run-time flag makes
+/// the *same* query a binder error on half the files, and every consumer — dashboards, notebooks,
+/// generated SQL — pays for that. All-NULL is a value; a missing column is a broken query.
+pub const GEO_COLUMNS: [&str; 3] = ["SrcASN", "SrcCity", "SrcCountry"];
+
+/// Why a geo cell is NULL — the ambiguity that made a conditional column look attractive in the
+/// first place, resolved by pointing at the flag in `suzaku_meta` rather than by dropping the
+/// column.
+pub const GEO_COLUMN_COMMENT: &str = "MaxMind GeoIP enrichment of the source IP. NULL when -G/--geo-ip was not used \
+     (see suzaku_meta.geoip_enabled) or when the value is not a parseable IP address.";
+
 /// Quote an identifier for use in generated SQL. Column names come from the output profile YAML,
 /// so they are not statically known and must be escaped rather than trusted.
 pub fn quote_ident(name: &str) -> String {
@@ -114,6 +128,10 @@ pub struct SuzakuMeta {
     /// Revision of the ruleset used, when the rules directory is a git checkout.
     pub rules_version: Option<String>,
     pub rules_count: Option<i64>,
+    /// Whether `-G, --geo-ip` ran. The geo columns exist either way, so this is what tells an
+    /// all-NULL `SrcCountry` ("enrichment was off") apart from a NULL cell in an enriched file
+    /// ("this value is not an IP address").
+    pub geoip_enabled: bool,
     pub scanned_files: Option<i64>,
     pub scanned_events: Option<i64>,
     /// Rows in the main table after deduplication.
@@ -130,6 +148,7 @@ impl SuzakuMeta {
             timestamp_tz: "UTC".to_string(),
             rules_version: None,
             rules_count: None,
+            geoip_enabled: false,
             scanned_files: None,
             scanned_events: None,
             output_rows: None,
@@ -145,6 +164,12 @@ impl SuzakuMeta {
         } else {
             "UTC".to_string()
         };
+        self
+    }
+
+    /// Record whether the run enriched source IPs with MaxMind data.
+    pub fn with_geoip(mut self, geoip_enabled: bool) -> Self {
+        self.geoip_enabled = geoip_enabled;
         self
     }
 
@@ -183,6 +208,7 @@ pub fn write_meta(conn: &Connection, meta: &SuzakuMeta) -> Result<(), String> {
              timestamp_tz           VARCHAR,
              rules_version          VARCHAR,
              rules_count            BIGINT,
+             geoip_enabled          BOOLEAN NOT NULL,
              scanned_files          BIGINT,
              scanned_events         BIGINT,
              output_rows            BIGINT,
@@ -191,7 +217,7 @@ pub fn write_meta(conn: &Connection, meta: &SuzakuMeta) -> Result<(), String> {
     )
     .map_err(|e| format!("Cannot create the suzaku_meta table: {e}"))?;
     conn.execute(
-        "INSERT INTO suzaku_meta VALUES (?, ?, ?, ?, now(), ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO suzaku_meta VALUES (?, ?, ?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             SCHEMA_VERSION,
             VERSION,
@@ -200,6 +226,7 @@ pub fn write_meta(conn: &Connection, meta: &SuzakuMeta) -> Result<(), String> {
             meta.timestamp_tz,
             meta.rules_version,
             meta.rules_count,
+            meta.geoip_enabled,
             meta.scanned_files,
             meta.scanned_events,
             meta.output_rows,
@@ -432,20 +459,26 @@ mod tests {
     #[test]
     fn meta_table_is_single_row_and_self_describing() {
         let conn = Connection::open_in_memory().unwrap();
-        let mut meta = SuzakuMeta::new("aws-ct-timeline").with_localtime(false);
+        let mut meta = SuzakuMeta::new("aws-ct-timeline")
+            .with_localtime(false)
+            .with_geoip(true);
         meta.output_rows = Some(42);
         write_meta(&conn, &meta).unwrap();
 
-        let (version, command, tz, rows): (i32, String, String, i64) = conn
+        let (version, command, tz, geoip, rows): (i32, String, String, bool, i64) = conn
             .query_row(
-                "SELECT schema_version, command, timestamp_tz, output_rows FROM suzaku_meta",
+                "SELECT schema_version, command, timestamp_tz, geoip_enabled, output_rows
+                 FROM suzaku_meta",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(command, "aws-ct-timeline");
         assert_eq!(tz, "UTC");
+        // The geo columns are unconditional, so this flag is the only thing that says whether an
+        // all-NULL SrcCountry means "enrichment was off" or "nothing resolved".
+        assert!(geoip);
         assert_eq!(rows, 42);
         assert_eq!(count_rows(&conn, "suzaku_meta").unwrap(), 1);
         // The table documents itself, so `duckdb_tables()` answers "what is this file?".

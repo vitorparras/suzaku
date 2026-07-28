@@ -67,7 +67,7 @@ Display Settings:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | sourceIPAddress | 203.0.113.10 | 1,024 | 62.19% | 2021-07-05 13:03:12 | 2021-07-05 13:03:50 | Example ISP | London | United Kingdom |
 
-`SrcASN`・`SrcCity`・`SrcCountry`列は`-G`を指定した場合のみ出力され、IPアドレスとして解釈できる値のみが対象となります(`cloudtrail.amazonaws.com`のようなAWSサービスからの呼び出しは`-`になります)。
+CSV・JSON・画面出力では、`SrcASN`・`SrcCity`・`SrcCountry`列は`-G`を指定した場合のみ出力され、IPアドレスとして解釈できる値のみが対象となります(`cloudtrail.amazonaws.com`のようなAWSサービスからの呼び出しは`-`になります)。DuckDB出力では、同じクエリがどのファイルに対しても動くように、この3列は常に出力されます(下記参照)。
 
 DuckDB出力は単一の`metrics`テーブルと[`suzaku_meta`](dfir-timeline.md#duckdb-output-schema)テーブル(実行情報)で構成されるため、`SELECT * FROM metrics WHERE Field = 'sourceIPAddress' ORDER BY Count DESC`のようにそのままクエリできます。値は表示用の文字列ではなく型付きで格納され、テキスト形式には無い2つの列が追加されます:
 
@@ -80,7 +80,7 @@ DuckDB出力は単一の`metrics`テーブルと[`suzaku_meta`](dfir-timeline.md
 | `FieldTotal` | `BIGINT` | この`Field`で集計されたイベント数、すなわち`Percent`の分母 |
 | `Percent` | `DOUBLE` | `Count / FieldTotal`を丸めずに格納。CSVの`62.19%`と異なり、フィールドごとの合計が100になります |
 | `FirstSeen` / `LastSeen` | `TIMESTAMP` | |
-| `SrcASN` / `SrcCity` / `SrcCountry` | `VARCHAR` | `-G`指定時のみ |
+| `SrcASN` / `SrcCity` / `SrcCountry` | `VARCHAR` | CSVと異なり常に出力されます。`-G`未指定時(`suzaku_meta.geoip_enabled`が`false`)や、値がIPアドレスでない場合は`NULL` |
 
 そのため、丸められた割合を再集計するのではなく、正確な割合をクエリで求められます:
 
