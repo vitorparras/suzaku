@@ -63,6 +63,8 @@ pub fn scan_file<'a>(
     );
 }
 
+/// Scan every log file under `d`, returning how many files were read (recorded in the DuckDB
+/// output's `suzaku_meta.scanned_files`, so a report can state the coverage of the run).
 #[allow(clippy::too_many_arguments)]
 pub fn scan_directory<'a>(
     d: &PathBuf,
@@ -73,7 +75,7 @@ pub fn scan_directory<'a>(
     matched_correlation: &mut Vec<TimestampedEvent<'a>>,
     correlation_engine: &'a CorrelationEngine,
     log: &LogSource,
-) {
+) -> usize {
     let no_color = context.config.no_color;
     let process_events = |events: &[Value]| {
         detect_events(
@@ -86,7 +88,7 @@ pub fn scan_directory<'a>(
             correlation_engine,
         );
     };
-    if let Err(e) = process_events_from_dir(
+    match process_events_from_dir(
         process_events,
         d,
         options.output_opt.output.is_some(),
@@ -94,10 +96,15 @@ pub fn scan_directory<'a>(
         log,
         &options.input_opt.file_date_opt,
     ) {
-        log_error(&format!("Failed to scan directory {}: {e}", d.display()));
+        Ok(files) => files,
+        Err(e) => {
+            log_error(&format!("Failed to scan directory {}: {e}", d.display()));
+            0
+        }
     }
 }
 
+/// Returns the number of log files that were handed to `process_events`.
 pub fn process_events_from_dir<F>(
     mut process_events: F,
     directory: &PathBuf,
@@ -105,7 +112,7 @@ pub fn process_events_from_dir<F>(
     no_color: bool,
     log: &LogSource,
     file_date_opt: &FileDateOption,
-) -> Result<(), Box<dyn Error>>
+) -> Result<usize, Box<dyn Error>>
 where
     F: FnMut(&[Value]),
 {
@@ -163,6 +170,7 @@ where
         pb.enable_steady_tick(Duration::from_millis(300));
     }
 
+    let mut scanned_files = 0usize;
     for path in file_paths {
         // `path` is the real `PathBuf`, so files with non-UTF-8 names still resolve and are read.
         // Render lossily only for the extension checks (extensions are ASCII) and the progress
@@ -182,6 +190,7 @@ where
                 Ok(events) => {
                     let events = normalize_events(events, log);
                     process_events(&events);
+                    scanned_files += 1;
                 }
                 Err(e) => log_warn(&format!("Skipping {path_str}: {e}")),
             }
@@ -234,6 +243,7 @@ where
         };
         let events = normalize_events(events, log);
         process_events(&events);
+        scanned_files += 1;
 
         if show_progress {
             pb.inc(1);
@@ -246,7 +256,7 @@ where
             pb.finish_with_message(style("Scanning finished.\n").color256(214).to_string());
         }
     }
-    Ok(())
+    Ok(scanned_files)
 }
 
 /// Normalize one raw Azure/M365 record before rule matching.

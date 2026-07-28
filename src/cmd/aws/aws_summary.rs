@@ -1,4 +1,8 @@
 use crate::core::color::SuzakuColor::Red;
+use crate::core::duckdb_out::{
+    self, MULTI_VALUE_SEPARATOR, OUTCOME_ENUM, SuzakuMeta, list_expr, nullable, quote_ident,
+    timestamp_expr,
+};
 use crate::core::errorlog::{log_error, log_warn};
 use crate::core::log_source::LogSource;
 use crate::core::scan::{load_aws_events_from_file, process_events_from_dir};
@@ -16,7 +20,7 @@ use num_format::{Locale, ToFormattedString};
 use serde::Serialize;
 use serde_json::Value;
 use sigma_rust::{Event, event_from_json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -74,7 +78,10 @@ struct CTSummary {
     other_api_failed: HashMap<String, (usize, String, String)>,
     aws_regions: HashMap<String, (usize, String, String)>,
     src_ips: HashMap<String, (usize, String, String)>,
-    user_types: String,
+    /// Every identity type this principal was seen with. Previously a single `String` that each
+    /// event overwrote, so a principal seen as both `AssumedRole` and `IAMUser` reported only
+    /// whichever event happened to be processed last.
+    user_types: BTreeSet<String>,
     access_key_ids: HashMap<String, (usize, String, String)>,
     user_agents: HashMap<String, (usize, String, String)>,
 }
@@ -105,7 +112,7 @@ impl CTSummary {
 
         upsert_count_entry(&mut self.aws_regions, aws_region, &event_time);
         upsert_count_entry(&mut self.src_ips, source_ip, &event_time);
-        self.user_types = user_type;
+        self.user_types.insert(user_type);
         upsert_count_entry(&mut self.access_key_ids, access_key_id, &event_time);
         upsert_count_entry(&mut self.user_agents, user_agent, &event_time);
 
@@ -194,7 +201,12 @@ fn build_json_records(
             other_apis_failed: map_to_api_entries(&summary.other_api_failed, false),
             aws_regions: map_to_count_entries(&summary.aws_regions),
             src_ips: map_to_count_entries(&summary.src_ips),
-            user_types: summary.user_types.clone(),
+            user_types: summary
+                .user_types
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(MULTI_VALUE_SEPARATOR),
             user_access_key_ids: map_to_count_entries(&summary.access_key_ids),
             user_agents: map_to_count_entries(&summary.user_agents),
         })
@@ -367,6 +379,7 @@ pub fn aws_summary(
             abused_aws_api_values,
             output_types,
             clobber,
+            geo_ip.is_some(),
         );
     } else if let Some(f) = file {
         let events = load_aws_events_from_file(f);
@@ -380,6 +393,7 @@ pub fn aws_summary(
                 abused_aws_api_values,
                 output_types,
                 clobber,
+                geo_ip.is_some(),
             );
         }
     }
@@ -398,6 +412,10 @@ fn output_summary(
     abused_aws_api_disc: Vec<String>,
     output_types: &[OutputFormat],
     clobber: bool,
+    // Whether -G ran. This command has no geo columns — the enrichment is appended to the SrcIP
+    // value itself — so it only reaches suzaku_meta, where it tells a consumer that those values
+    // carry an "(ASN, city, country)" suffix.
+    geo_enabled: bool,
 ) {
     if user_data.is_empty() {
         error_msg(no_color, "No events found.");
@@ -496,7 +514,12 @@ fn output_summary(
                 .replace("Z", "");
             let aws_regions = fmt_key_total("Total regions", &summary.aws_regions);
             let src_ips = fmt_key_total("Total source IPs", &summary.src_ips);
-            let user_types = &summary.user_types;
+            let user_types = summary
+                .user_types
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(MULTI_VALUE_SEPARATOR);
             let access_key_ids = fmt_key_total("Total access key IDs", &summary.access_key_ids);
             let user_agents = fmt_key_total("Total user agents", &summary.user_agents);
 
@@ -541,7 +564,7 @@ fn output_summary(
                 sanitize_csv_field(&other_fai),
                 sanitize_csv_field(&aws_regions),
                 sanitize_csv_field(&src_ips),
-                sanitize_csv_field(user_types),
+                sanitize_csv_field(&user_types),
                 sanitize_csv_field(&access_key_ids),
                 sanitize_csv_field(&user_agents),
             ];
@@ -587,7 +610,7 @@ fn output_summary(
     // --- DuckDB 出力 ---
     if let Some(duckdb_path) = duckdb_path {
         let records = build_json_records(user_data, *hide_descriptions);
-        match write_duckdb_summary(&duckdb_path, &records) {
+        match write_duckdb_summary(&duckdb_path, &records, geo_enabled) {
             Ok(()) => output_paths.push(duckdb_path),
             Err(e) => fatal_error(no_color, &e),
         }
@@ -596,7 +619,21 @@ fn output_summary(
     output_path_info(no_color, output_paths.as_slice(), true);
 }
 
-/// Write the summary to a DuckDB database as three related tables.
+/// Split `"RunInstances (ec2.amazonaws.com)"` into its action and its service.
+///
+/// The two are already separate columns in the timeline output (`EventName`, `EventSource`), so
+/// packing them back into one string here made the same two facts need string parsing in one
+/// command and not the other. Returns an empty service when the value does not carry one.
+fn split_api(api: &str) -> (&str, &str) {
+    if let Some(open) = api.rfind(" (")
+        && api.ends_with(')')
+    {
+        return (&api[..open], &api[open + 2..api.len() - 1]);
+    }
+    (api, "")
+}
+
+/// Write the summary to a DuckDB database as three related tables plus `suzaku_meta`.
 ///
 /// The CSV output folds each user's API calls, regions, IPs, keys and agents
 /// into multi-line text blobs, which is right for a spreadsheet and useless in
@@ -604,122 +641,183 @@ fn output_summary(
 /// nested structure of the JSON records is kept as relations instead:
 ///
 ///   summary             one row per principal
-///   summary_api_calls   one row per (principal, API), tagged with its category
+///   summary_api_calls   one row per (principal, API), with its abused/outcome axes
 ///   summary_attributes  one row per (principal, attribute value)
 ///
 /// so questions the CSV cannot answer — which principals share an access key,
 /// which source IPs called a given abused API — are ordinary joins.
 ///
-/// Counts are stored as BIGINT. Timestamps stay VARCHAR in Suzaku's rendered
-/// `YYYY-MM-DD HH:MM:SS` form: it sorts correctly as text and can be CAST when
-/// wanted, which avoids failing the whole write on one unparseable value.
-fn write_duckdb_summary(path: &Path, records: &[SummaryJsonRecord]) -> Result<(), String> {
+/// Values are typed rather than rendered: timestamps are `TIMESTAMP`, counts `BIGINT`, the
+/// old `Category` string is split into the two orthogonal axes it always encoded (`IsAbused`
+/// boolean + `Outcome` enum), the `API` string into `API` + `EventSource`, and `UserTypes` into a
+/// list. `-`/empty placeholders become NULL. See `core::duckdb_out` for why the rows go through a
+/// staging table on the way in.
+fn write_duckdb_summary(
+    path: &Path,
+    records: &[SummaryJsonRecord],
+    geo_enabled: bool,
+) -> Result<(), String> {
     let conn = Connection::open(path)
         .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
-    conn.execute_batch(
-        "CREATE OR REPLACE TABLE summary (
-             UserARN VARCHAR,
-             NumOfEvents BIGINT,
-             FirstTimestamp VARCHAR,
-             LastTimestamp VARCHAR,
-             UserTypes VARCHAR
-         );
-         CREATE OR REPLACE TABLE summary_api_calls (
-             UserARN VARCHAR,
-             Category VARCHAR,
-             API VARCHAR,
+
+    // Column expressions are shared between the three tables where the column means the same
+    // thing, so a change to (say) how a timestamp is parsed cannot drift between them.
+    let raw = |c: &str| quote_ident(c);
+    let bigint = |c: &str| format!("TRY_CAST({} AS BIGINT)", nullable(&quote_ident(c)));
+
+    let summary_rows: Vec<Vec<String>> = records
+        .iter()
+        .map(|r| {
+            vec![
+                r.user_arn.clone(),
+                r.num_of_events.to_string(),
+                r.first_timestamp.clone(),
+                r.last_timestamp.clone(),
+                r.user_types.clone(),
+            ]
+        })
+        .collect();
+    duckdb_out::stage_and_type(
+        &conn,
+        "summary",
+        "UserARN VARCHAR NOT NULL,
+         NumOfEvents BIGINT NOT NULL,
+         FirstTimestamp TIMESTAMP,
+         LastTimestamp TIMESTAMP,
+         UserTypes VARCHAR[]",
+        &[
+            ("UserARN", raw("UserARN")),
+            ("NumOfEvents", bigint("NumOfEvents")),
+            (
+                "FirstTimestamp",
+                timestamp_expr(&quote_ident("FirstTimestamp")),
+            ),
+            (
+                "LastTimestamp",
+                timestamp_expr(&quote_ident("LastTimestamp")),
+            ),
+            ("UserTypes", list_expr(&quote_ident("UserTypes"))),
+        ],
+        &summary_rows,
+    )?;
+
+    let mut api_rows: Vec<Vec<String>> = Vec::new();
+    for record in records {
+        // The four buckets are two independent yes/no facts, not four categories: keeping them as
+        // `abused_success`/`other_failed` strings forced `LIKE 'abused%'` for one and
+        // `LIKE '%failed'` for the other.
+        for (is_abused, outcome, entries) in [
+            (true, "success", &record.abused_apis_success),
+            (true, "failed", &record.abused_apis_failed),
+            (false, "success", &record.other_apis_success),
+            (false, "failed", &record.other_apis_failed),
+        ] {
+            for entry in entries {
+                let (api, event_source) = split_api(&entry.api);
+                api_rows.push(vec![
+                    record.user_arn.clone(),
+                    is_abused.to_string(),
+                    outcome.to_string(),
+                    api.to_string(),
+                    event_source.to_string(),
+                    entry.description.clone(),
+                    entry.count.to_string(),
+                    entry.first_seen.clone(),
+                    entry.last_seen.clone(),
+                ]);
+            }
+        }
+    }
+    duckdb_out::stage_and_type(
+        &conn,
+        "summary_api_calls",
+        &format!(
+            "UserARN VARCHAR NOT NULL,
+             IsAbused BOOLEAN NOT NULL,
+             Outcome {OUTCOME_ENUM} NOT NULL,
+             API VARCHAR NOT NULL,
+             EventSource VARCHAR,
              Description VARCHAR,
-             Count BIGINT,
-             FirstSeen VARCHAR,
-             LastSeen VARCHAR
-         );
-         CREATE OR REPLACE TABLE summary_attributes (
-             UserARN VARCHAR,
-             Attribute VARCHAR,
-             Value VARCHAR,
-             Count BIGINT,
-             FirstSeen VARCHAR,
-             LastSeen VARCHAR
-         );",
-    )
-    .map_err(|e| format!("Cannot create DuckDB tables in {}: {e}", path.display()))?;
+             Count BIGINT NOT NULL,
+             FirstSeen TIMESTAMP,
+             LastSeen TIMESTAMP"
+        ),
+        &[
+            ("UserARN", raw("UserARN")),
+            ("IsAbused", format!("CAST({} AS BOOLEAN)", raw("IsAbused"))),
+            (
+                "Outcome",
+                format!("CAST({} AS {OUTCOME_ENUM})", raw("Outcome")),
+            ),
+            ("API", raw("API")),
+            ("EventSource", nullable(&quote_ident("EventSource"))),
+            ("Description", nullable(&quote_ident("Description"))),
+            ("Count", bigint("Count")),
+            ("FirstSeen", timestamp_expr(&quote_ident("FirstSeen"))),
+            ("LastSeen", timestamp_expr(&quote_ident("LastSeen"))),
+        ],
+        &api_rows,
+    )?;
 
-    let mut summary_app = conn
-        .appender("summary")
-        .map_err(|e| format!("Cannot write summary rows to {}: {e}", path.display()))?;
+    let mut attr_rows: Vec<Vec<String>> = Vec::new();
     for record in records {
-        summary_app
-            .append_row(duckdb::params![
-                record.user_arn,
-                record.num_of_events as i64,
-                record.first_timestamp,
-                record.last_timestamp,
-                record.user_types,
-            ])
-            .map_err(|e| format!("Cannot write summary rows to {}: {e}", path.display()))?;
-    }
-    summary_app
-        .flush()
-        .map_err(|e| format!("Cannot write summary rows to {}: {e}", path.display()))?;
-
-    let mut api_app = conn
-        .appender("summary_api_calls")
-        .map_err(|e| format!("Cannot write API rows to {}: {e}", path.display()))?;
-    for record in records {
-        for (category, entries) in [
-            ("abused_success", &record.abused_apis_success),
-            ("abused_failed", &record.abused_apis_failed),
-            ("other_success", &record.other_apis_success),
-            ("other_failed", &record.other_apis_failed),
-        ] {
-            for entry in entries {
-                api_app
-                    .append_row(duckdb::params![
-                        record.user_arn,
-                        category,
-                        entry.api,
-                        entry.description,
-                        entry.count as i64,
-                        entry.first_seen,
-                        entry.last_seen,
-                    ])
-                    .map_err(|e| format!("Cannot write API rows to {}: {e}", path.display()))?;
-            }
-        }
-    }
-    api_app
-        .flush()
-        .map_err(|e| format!("Cannot write API rows to {}: {e}", path.display()))?;
-
-    let mut attr_app = conn
-        .appender("summary_attributes")
-        .map_err(|e| format!("Cannot write attribute rows to {}: {e}", path.display()))?;
-    for record in records {
+        // Attribute labels are spelled exactly like the timeline columns holding the same fact,
+        // so `src_ip` / `SrcIP` / `sourceIPAddress` stop being three names for one concept.
         for (attribute, entries) in [
-            ("aws_region", &record.aws_regions),
-            ("src_ip", &record.src_ips),
-            ("access_key_id", &record.user_access_key_ids),
-            ("user_agent", &record.user_agents),
+            ("AwsRegion", &record.aws_regions),
+            ("SrcIP", &record.src_ips),
+            ("UserAccessKeyID", &record.user_access_key_ids),
+            ("UserAgent", &record.user_agents),
         ] {
             for entry in entries {
-                attr_app
-                    .append_row(duckdb::params![
-                        record.user_arn,
-                        attribute,
-                        entry.value,
-                        entry.count as i64,
-                        entry.first_seen,
-                        entry.last_seen,
-                    ])
-                    .map_err(|e| {
-                        format!("Cannot write attribute rows to {}: {e}", path.display())
-                    })?;
+                attr_rows.push(vec![
+                    record.user_arn.clone(),
+                    attribute.to_string(),
+                    entry.value.clone(),
+                    entry.count.to_string(),
+                    entry.first_seen.clone(),
+                    entry.last_seen.clone(),
+                ]);
             }
         }
     }
-    attr_app
-        .flush()
-        .map_err(|e| format!("Cannot write attribute rows to {}: {e}", path.display()))
+    duckdb_out::stage_and_type(
+        &conn,
+        "summary_attributes",
+        "UserARN VARCHAR NOT NULL,
+         Attribute VARCHAR NOT NULL,
+         Value VARCHAR,
+         Count BIGINT NOT NULL,
+         FirstSeen TIMESTAMP,
+         LastSeen TIMESTAMP",
+        &[
+            ("UserARN", raw("UserARN")),
+            ("Attribute", raw("Attribute")),
+            ("Value", nullable(&quote_ident("Value"))),
+            ("Count", bigint("Count")),
+            ("FirstSeen", timestamp_expr(&quote_ident("FirstSeen"))),
+            ("LastSeen", timestamp_expr(&quote_ident("LastSeen"))),
+        ],
+        &attr_rows,
+    )?;
+
+    let mut meta = SuzakuMeta::new("aws-ct-summary").with_geoip(geo_enabled);
+    meta.output_rows = Some(records.len() as i64);
+    duckdb_out::write_meta(&conn, &meta)?;
+    duckdb_out::comment_on_table(&conn, "summary", "One row per principal (UserARN).")?;
+    duckdb_out::comment_on_table(
+        &conn,
+        "summary_api_calls",
+        "One row per (UserARN, API call). IsAbused and Outcome are the two axes the old Category \
+         string packed together.",
+    )?;
+    duckdb_out::comment_on_table(
+        &conn,
+        "summary_attributes",
+        "One row per (UserARN, attribute, value). Attribute names match the timeline columns \
+         holding the same fact.",
+    )?;
+    duckdb_out::checkpoint(&conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1149,7 @@ mod tests {
             vec![],
             &[OutputFormat::Csv],
             false,
+            false,
         );
 
         assert!(tmp.path().join("result.csv").exists());
@@ -1073,6 +1172,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Json],
+            false,
             false,
         );
 
@@ -1097,6 +1197,7 @@ mod tests {
             vec![],
             &[OutputFormat::Jsonl],
             false,
+            false,
         );
 
         assert!(!tmp.path().join("result.csv").exists());
@@ -1120,6 +1221,7 @@ mod tests {
             vec![],
             &[OutputFormat::Csv, OutputFormat::Json],
             false,
+            false,
         );
 
         assert!(tmp.path().join("result.csv").exists());
@@ -1142,6 +1244,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Csv, OutputFormat::Jsonl],
+            false,
             false,
         );
 
@@ -1169,6 +1272,7 @@ mod tests {
             vec![],
             &[OutputFormat::Json],
             false,
+            false,
         );
 
         let content = std::fs::read_to_string(tmp.path().join("result.json")).unwrap();
@@ -1195,6 +1299,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Jsonl],
+            false,
             false,
         );
 
@@ -1226,6 +1331,7 @@ mod tests {
             vec![],
             &[OutputFormat::Json],
             false,
+            false,
         );
 
         // 上書きされていないこと
@@ -1253,6 +1359,7 @@ mod tests {
             vec![],
             &[OutputFormat::Csv, OutputFormat::Json],
             false,
+            false,
         );
 
         assert_eq!(std::fs::read_to_string(&json_path).unwrap(), "original");
@@ -1278,6 +1385,7 @@ mod tests {
             vec![],
             &[OutputFormat::Json],
             true,
+            false,
         );
 
         let content = std::fs::read_to_string(&json_path).unwrap();
@@ -1305,23 +1413,36 @@ mod tests {
             vec![],
             &[OutputFormat::Duckdb],
             false,
+            false,
         );
 
         assert!(duckdb_path.exists(), "the .duckdb database must be written");
         let conn = Connection::open(&duckdb_path).unwrap();
 
+        // Timestamps are real TIMESTAMPs, so they are rendered here rather than compared as text.
         let (arn, events, first, last): (String, i64, String, String) = conn
             .query_row(
-                "SELECT UserARN, NumOfEvents, FirstTimestamp, LastTimestamp FROM summary",
+                "SELECT UserARN, NumOfEvents,
+                        strftime(FirstTimestamp, '%Y-%m-%d %H:%M:%S'),
+                        strftime(LastTimestamp, '%Y-%m-%d %H:%M:%S')
+                 FROM summary",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(arn, "arn::test");
         assert_eq!(events, user_data["arn::test"].num_of_events as i64);
-        // Timestamps keep Suzaku's rendered form, which sorts correctly as text.
         assert_eq!(first, "2024-01-01 00:00:00");
         assert_eq!(last, "2024-01-02 00:00:00");
+        let ts_type: String = conn
+            .query_row(
+                "SELECT data_type FROM duckdb_columns()
+                 WHERE table_name = 'summary' AND column_name = 'FirstTimestamp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts_type, "TIMESTAMP");
 
         // Every API and attribute entry becomes its own row, tagged with the
         // category/attribute it came from, rather than a text blob.
@@ -1351,6 +1472,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Duckdb],
+            false,
             false,
         );
 
@@ -1391,8 +1513,11 @@ mod tests {
         assert_eq!(attr_rows, expected_attrs as i64);
     }
 
+    /// The old `Category` column packed two orthogonal facts into one string, forcing
+    /// `LIKE 'abused%'` for one and `LIKE '%failed'` for the other. They are now separate typed
+    /// columns, and the service is split out of the API name.
     #[test]
-    fn duckdb_summary_categories_are_labelled() {
+    fn duckdb_summary_api_calls_split_their_packed_columns() {
         let tmp = TempDir::new().unwrap();
         let output_path = tmp.path().join("result");
 
@@ -1407,30 +1532,36 @@ mod tests {
             vec![],
             &[OutputFormat::Duckdb],
             false,
+            false,
         );
 
         let conn = Connection::open(tmp.path().join("result.duckdb")).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT Category FROM summary_api_calls ORDER BY 1")
+        // `Category` is gone; asking "which abused calls succeeded" is now a plain conjunction.
+        let (api, source, description): (String, String, String) = conn
+            .query_row(
+                "SELECT API, EventSource, Description FROM summary_api_calls
+                 WHERE IsAbused AND Outcome = 'success'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        let categories: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        for category in &categories {
-            assert!(
-                [
-                    "abused_success",
-                    "abused_failed",
-                    "other_success",
-                    "other_failed"
-                ]
-                .contains(&category.as_str()),
-                "unexpected category label: {category}"
-            );
-        }
+        assert_eq!(api, "ListBuckets");
+        assert_eq!(source, "s3.amazonaws.com");
+        assert_eq!(description, "List all S3 buckets");
 
+        let (non_abused, outcomes): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*) FILTER (WHERE NOT IsAbused),
+                        count(DISTINCT Outcome)
+                 FROM summary_api_calls",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(non_abused, 1);
+        assert_eq!(outcomes, 1, "the fixture only has successful calls");
+
+        // Attribute labels are spelled like the timeline columns holding the same fact.
         let mut stmt = conn
             .prepare("SELECT DISTINCT Attribute FROM summary_attributes ORDER BY 1")
             .unwrap();
@@ -1441,11 +1572,104 @@ mod tests {
             .collect();
         for attribute in &attributes {
             assert!(
-                ["aws_region", "src_ip", "access_key_id", "user_agent"]
+                ["AwsRegion", "SrcIP", "UserAccessKeyID", "UserAgent"]
                     .contains(&attribute.as_str()),
                 "unexpected attribute label: {attribute}"
             );
         }
+    }
+
+    /// `UserTypes` is plural, so it is a list. It also has to hold *every* identity type the
+    /// principal was seen with, not just the one from the last event processed.
+    #[test]
+    fn duckdb_summary_user_types_is_a_list_of_every_type_seen() {
+        let tmp = TempDir::new().unwrap();
+        let output_path = tmp.path().join("result");
+
+        let mut summary = make_test_summary();
+        summary.add_event(
+            "2024-01-03T00:00:00Z".to_string(),
+            "us-east-1".to_string(),
+            "1.2.3.4".to_string(),
+            "AssumedRole".to_string(),
+            "AKIAIOSFODNN7EXAMPLE".to_string(),
+            "aws-cli/2.0".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+        );
+        let mut user_data = HashMap::new();
+        user_data.insert("arn::test".to_string(), summary);
+
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Duckdb],
+            false,
+            false,
+        );
+
+        let conn = Connection::open(tmp.path().join("result.duckdb")).unwrap();
+        let (types, kind): (String, String) = conn
+            .query_row(
+                "SELECT list_aggregate(UserTypes, 'string_agg', ','),
+                        (SELECT data_type FROM duckdb_columns()
+                         WHERE table_name = 'summary' AND column_name = 'UserTypes')
+                 FROM summary",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "VARCHAR[]");
+        assert_eq!(types, "AssumedRole,IAMUser");
+    }
+
+    /// P1: the summary file says what produced it, like the timeline file does.
+    #[test]
+    fn duckdb_summary_writes_self_describing_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let output_path = tmp.path().join("result");
+
+        let mut user_data = HashMap::new();
+        user_data.insert("arn::test".to_string(), make_test_summary());
+
+        output_summary(
+            &user_data,
+            &output_path,
+            true,
+            &false,
+            vec![],
+            &[OutputFormat::Duckdb],
+            false,
+            false,
+        );
+
+        let conn = Connection::open(tmp.path().join("result.duckdb")).unwrap();
+        let (schema_version, command, rows): (i32, String, i64) = conn
+            .query_row(
+                "SELECT schema_version, command, output_rows FROM suzaku_meta",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(schema_version, duckdb_out::SCHEMA_VERSION);
+        assert_eq!(command, "aws-ct-summary");
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn split_api_separates_action_from_service() {
+        assert_eq!(
+            split_api("RunInstances (ec2.amazonaws.com)"),
+            ("RunInstances", "ec2.amazonaws.com")
+        );
+        // A value that does not carry a service is left whole.
+        assert_eq!(split_api("RunInstances"), ("RunInstances", ""));
+        assert_eq!(split_api("-"), ("-", ""));
     }
 
     #[test]
@@ -1463,6 +1687,7 @@ mod tests {
             &false,
             vec![],
             &[OutputFormat::Csv, OutputFormat::Json, OutputFormat::Duckdb],
+            false,
             false,
         );
 

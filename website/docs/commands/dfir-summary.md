@@ -183,19 +183,27 @@ more than one file:
   into multi-line cells. Best read in Timeline Explorer or Numbers rather than Excel.
 * `json` / `jsonl` — the same data with those cells kept as nested arrays.
 * `duckdb` — a self-contained DuckDB database. Because the CSV's multi-line cells cannot be
-  queried, the nested data is stored **relationally** across three tables:
+  queried, the nested data is stored **relationally** across three tables, plus the
+  [`suzaku_meta`](dfir-timeline.md#duckdb-output-schema) provenance table:
 
 | Table | One row per | Columns |
 |---|---|---|
 | `summary` | principal | `UserARN`, `NumOfEvents`, `FirstTimestamp`, `LastTimestamp`, `UserTypes` |
-| `summary_api_calls` | principal + API | `UserARN`, `Category`, `API`, `Description`, `Count`, `FirstSeen`, `LastSeen` |
+| `summary_api_calls` | principal + API | `UserARN`, `IsAbused`, `Outcome`, `API`, `EventSource`, `Description`, `Count`, `FirstSeen`, `LastSeen` |
 | `summary_attributes` | principal + value | `UserARN`, `Attribute`, `Value`, `Count`, `FirstSeen`, `LastSeen` |
 
-`Category` is one of `abused_success`, `abused_failed`, `other_success`, `other_failed`.
-`Attribute` is one of `aws_region`, `src_ip`, `access_key_id`, `user_agent`.
+Values are typed rather than rendered:
 
-Counts are `BIGINT`; timestamps stay `VARCHAR` in Suzaku's rendered `YYYY-MM-DD HH:MM:SS` form,
-which sorts correctly as text and can be `CAST` when you want real timestamps.
+* `FirstTimestamp` / `LastTimestamp` / `FirstSeen` / `LastSeen` are `TIMESTAMP`, and
+  `NumOfEvents` / `Count` are `BIGINT`.
+* `IsAbused` is a `BOOLEAN` and `Outcome` an `ENUM('success','failed')` — the two independent
+  facts the old single `Category` string packed together.
+* `API` holds the action only (`RunInstances`); the service moved to its own `EventSource`
+  column, spelled like the timeline column holding the same fact.
+* `UserTypes` is a `VARCHAR[]` listing every identity type the principal was seen with.
+* `Attribute` is one of `AwsRegion`, `SrcIP`, `UserAccessKeyID`, `UserAgent` — again the same
+  spelling as the timeline columns.
+* `-` and empty placeholders are written as `NULL`.
 
 This makes questions the CSV cannot answer into ordinary joins — for example, which source IPs
 were used by the principals that called an abused API:
@@ -204,8 +212,8 @@ were used by the principals that called an abused API:
 SELECT a.API, SUM(a.Count) AS calls, COUNT(DISTINCT t.Value) AS src_ips
 FROM summary_api_calls a
 JOIN summary_attributes t
-  ON t.UserARN = a.UserARN AND t.Attribute = 'src_ip'
-WHERE a.Category LIKE 'abused%'
+  ON t.UserARN = a.UserARN AND t.Attribute = 'SrcIP'
+WHERE a.IsAbused
 GROUP BY a.API
 ORDER BY calls DESC;
 ```

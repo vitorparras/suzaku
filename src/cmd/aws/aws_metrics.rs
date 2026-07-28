@@ -1,8 +1,9 @@
 use crate::core::color::SuzakuColor::Red;
-use crate::core::errorlog::log_error;
+use crate::core::duckdb_out::{self, SuzakuMeta, nullable, quote_ident, timestamp_expr};
+use crate::core::errorlog::{log_error, log_warn};
 use crate::core::log_source::LogSource;
 use crate::core::scan::{load_aws_events_from_file, process_events_from_dir};
-use crate::core::timeline_writer::resolve_output_targets;
+use crate::core::timeline_writer::{duckdb_column_name, resolve_output_targets};
 use crate::core::util::{
     error_msg, fatal_error, get_writer, output_path_info, p, sanitize_csv_field, upsert_count_entry,
 };
@@ -49,6 +50,14 @@ struct Metrics {
     fields: Vec<String>,
     per_field: Vec<FieldMetrics>,
     include_sts: bool,
+}
+
+/// What the run covered, for `suzaku_meta`. Neither number is derivable from the output rows:
+/// the rows are an aggregation, and every field's total excludes the events dropped by `-s`.
+#[derive(Default, Clone, Copy)]
+struct ScanStats {
+    files: usize,
+    events: usize,
 }
 
 impl Metrics {
@@ -114,6 +123,12 @@ pub struct MetricRecord {
     pub field: String,
     pub value: String,
     pub count: usize,
+    /// Events counted for this record's field, i.e. the denominator `percent` was derived from.
+    /// Not serialized: it exists so the DuckDB output can carry the denominator (`sum(Percent)`
+    /// over a field is 99.03, not 100, once every value has been rounded for display), and the
+    /// CSV and JSON outputs stay exactly as they were.
+    #[serde(skip)]
+    pub field_total: usize,
     pub percent: f64,
     pub first_seen: String,
     pub last_seen: String,
@@ -128,6 +143,16 @@ pub struct MetricRecord {
 impl MetricRecord {
     fn percent_str(&self) -> String {
         format!("{:.2}%", self.percent)
+    }
+
+    /// This value's share of its field, without the two-decimal rounding `percent` carries for
+    /// display. Written to DuckDB, where the number is re-aggregated rather than read.
+    fn exact_percent(&self) -> f64 {
+        if self.field_total == 0 {
+            0.0
+        } else {
+            self.count as f64 / self.field_total as f64 * 100.0
+        }
     }
 
     /// The three GeoIP cells, or `-` when this value could not be enriched. Only called for
@@ -166,8 +191,13 @@ pub fn aws_metrics(opt: &MetricsOptions, no_color: bool) {
     }
 
     let mut metrics = Metrics::new(&opt.field_names, opt.include_sts);
+    // Coverage of the run, recorded in the DuckDB output's `suzaku_meta` so a report can state
+    // what was aggregated. Counted before the time filter, like the other commands, so it means
+    // "events read" rather than "events that survived -T/-t".
+    let mut scan = ScanStats::default();
     let mut stats_func = |json_values: &[Value]| {
         for json_value in json_values {
+            scan.events += 1;
             if !filter_by_time(&opt.input_opt.time_opt, json_value, "eventTime") {
                 continue;
             }
@@ -180,7 +210,7 @@ pub fn aws_metrics(opt: &MetricsOptions, no_color: bool) {
     };
 
     if let Some(d) = directory {
-        if let Err(e) = process_events_from_dir(
+        match process_events_from_dir(
             stats_func,
             d,
             true,
@@ -188,16 +218,20 @@ pub fn aws_metrics(opt: &MetricsOptions, no_color: bool) {
             &LogSource::Aws,
             &opt.input_opt.file_date_opt,
         ) {
-            log_error(&format!("Failed to scan directory {}: {e}", d.display()));
+            Ok(files) => scan.files = files,
+            Err(e) => log_error(&format!("Failed to scan directory {}: {e}", d.display())),
         }
     } else if let Some(f) = file {
         match load_aws_events_from_file(f) {
-            Ok(events) => stats_func(&events),
+            Ok(events) => {
+                stats_func(&events);
+                scan.files = 1;
+            }
             Err(_) => return,
         }
     }
 
-    output_metrics(&metrics, opt, geo_search.as_mut(), no_color);
+    output_metrics(&metrics, opt, geo_search.as_mut(), no_color, scan);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +279,7 @@ fn build_records(metrics: &Metrics, geo_search: Option<&mut GeoIPSearch>) -> Vec
                 field: field.clone(),
                 value: value.clone(),
                 count: *count,
+                field_total: data.total,
                 percent: (percent * 100.0).round() / 100.0,
                 first_seen: render_time(first),
                 last_seen: render_time(last),
@@ -271,6 +306,7 @@ fn output_metrics(
     opt: &MetricsOptions,
     geo_search: Option<&mut GeoIPSearch>,
     no_color: bool,
+    scan: ScanStats,
 ) {
     if metrics.is_empty() {
         error_msg(no_color, "No results found.");
@@ -362,7 +398,7 @@ fn output_metrics(
     }
 
     if let Some(duckdb_path) = path_for(OutputFormat::Duckdb) {
-        match write_duckdb_metrics(&duckdb_path, &records) {
+        match write_duckdb_metrics(&duckdb_path, &records, geo_enabled, scan) {
             Ok(()) => output_paths.push(duckdb_path),
             Err(e) => fatal_error(no_color, &e),
         }
@@ -410,46 +446,130 @@ fn write_csv(path: &Path, records: &[MetricRecord], geo_enabled: bool, no_color:
     wtr.flush().ok();
 }
 
-/// Write the metrics to a DuckDB database as a single `metrics` table. Unlike the summary
-/// output there is no nesting to preserve here: one row per (field, value) is already the
-/// relational shape, so `GROUP BY Field` / `WHERE Value = ...` work directly.
-fn write_duckdb_metrics(path: &Path, records: &[MetricRecord]) -> Result<(), String> {
+/// CloudTrail field path -> the DuckDB timeline column holding the same fact, e.g.
+/// `sourceIPAddress` -> `SrcIP`.
+///
+/// `Field` keeps the path the user typed after `-F` — it is the command's input, it round-trips,
+/// and since `-F` accepts paths into the API-specific containers (`requestParameters.bucketName`)
+/// it has no timeline counterpart in the general case. Naming that counterpart in a second column
+/// is what stops `sourceIPAddress` / `SrcIP` from being two unrelatable spellings of one fact
+/// across two commands of the same tool.
+///
+/// The mapping is not new knowledge: the output profile already states it, so it is inverted here
+/// rather than copied. A missing profile leaves the column NULL instead of stopping a command that
+/// otherwise needs no configuration.
+fn timeline_column_map() -> HashMap<String, String> {
+    let profile_path = LogSource::Aws.profile_path();
+    let Ok(profile) = std::fs::read_to_string(profile_path) else {
+        log_warn(&format!(
+            "Could not open the output profile at '{profile_path}' \
+             (run from the directory that contains ./config). \
+             The DuckDB TimelineColumn column will be NULL for every row."
+        ));
+        return HashMap::new();
+    };
+    profile
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter_map(|(column, source)| {
+            // Only the entries fed by a CloudTrail path: `sigma.title` and friends come from the
+            // rule that matched, which a metric over raw events has no equivalent of.
+            let field = source.trim().trim_matches('\'').strip_prefix('.')?;
+            Some((field.to_string(), duckdb_column_name(column.trim())))
+        })
+        .collect()
+}
+
+/// Write the metrics to a DuckDB database as a single `metrics` table plus `suzaku_meta`. Unlike
+/// the summary output there is no nesting to preserve here: one row per (field, value) is already
+/// the relational shape, so `GROUP BY Field` / `WHERE Value = ...` work directly.
+///
+/// Values are typed rather than rendered, as everywhere else in the DuckDB output: `First/LastSeen`
+/// are `TIMESTAMP`, a missing value is `NULL` rather than the text placeholder, and `Percent` is
+/// stored at full precision alongside the `FieldTotal` it was derived from — the CSV's two-decimal
+/// rendering makes `sum(Percent)` 99.03 instead of 100, and the denominator needed to recompute it
+/// is per field, so it cannot live in `suzaku_meta`. The GeoIP columns are always present, unlike
+/// in the CSV output — a column that comes and goes with `-G` turns one query into a binder error
+/// on half the files — and `suzaku_meta.geoip_enabled` says whether they are NULL because
+/// enrichment was off or because the value was not an IP.
+fn write_duckdb_metrics(
+    path: &Path,
+    records: &[MetricRecord],
+    geo_enabled: bool,
+    scan: ScanStats,
+) -> Result<(), String> {
     let conn = Connection::open(path)
         .map_err(|e| format!("Cannot write to output file {}: {e}", path.display()))?;
-    conn.execute_batch(
-        "CREATE OR REPLACE TABLE metrics (
-             Field VARCHAR,
-             Value VARCHAR,
-             Count BIGINT,
-             Percent DOUBLE,
-             FirstSeen VARCHAR,
-             LastSeen VARCHAR,
-             SrcASN VARCHAR,
-             SrcCity VARCHAR,
-             SrcCountry VARCHAR
-         );",
-    )
-    .map_err(|e| format!("Cannot create DuckDB tables in {}: {e}", path.display()))?;
 
-    let mut app = conn
-        .appender("metrics")
-        .map_err(|e| format!("Cannot write metrics rows to {}: {e}", path.display()))?;
+    let timeline_columns = timeline_column_map();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(records.len());
     for record in records {
-        app.append_row(duckdb::params![
-            record.field,
-            record.value,
-            record.count as i64,
-            record.percent,
-            record.first_seen,
-            record.last_seen,
-            record.src_asn,
-            record.src_city,
-            record.src_country,
-        ])
-        .map_err(|e| format!("Cannot write metrics rows to {}: {e}", path.display()))?;
+        let mut row = vec![
+            record.field.clone(),
+            timeline_columns
+                .get(&record.field)
+                .cloned()
+                .unwrap_or_default(),
+            record.value.clone(),
+            record.count.to_string(),
+            record.field_total.to_string(),
+            record.exact_percent().to_string(),
+            record.first_seen.clone(),
+            record.last_seen.clone(),
+        ];
+        // Unenriched cells are the `-` placeholder here and `NULL` in the table: `geo_cells`
+        // already renders an absent value that way, whether it is absent because `-G` was not
+        // given or because the value is not an IP address.
+        row.extend(record.geo_cells());
+        rows.push(row);
     }
-    app.flush()
-        .map_err(|e| format!("Cannot write metrics rows to {}: {e}", path.display()))
+
+    let raw = |c: &str| quote_ident(c);
+    let text = |c: &str| nullable(&quote_ident(c));
+    let bigint = |c: &str| format!("TRY_CAST({} AS BIGINT)", nullable(&quote_ident(c)));
+
+    let mut ddl = String::from(
+        "Field VARCHAR NOT NULL,
+         TimelineColumn VARCHAR,
+         Value VARCHAR,
+         Count BIGINT NOT NULL,
+         FieldTotal BIGINT NOT NULL,
+         Percent DOUBLE NOT NULL,
+         FirstSeen TIMESTAMP,
+         LastSeen TIMESTAMP",
+    );
+    let mut columns: Vec<(&str, String)> = vec![
+        ("Field", raw("Field")),
+        ("TimelineColumn", text("TimelineColumn")),
+        ("Value", text("Value")),
+        ("Count", bigint("Count")),
+        ("FieldTotal", bigint("FieldTotal")),
+        ("Percent", format!("TRY_CAST({} AS DOUBLE)", raw("Percent"))),
+        ("FirstSeen", timestamp_expr(&quote_ident("FirstSeen"))),
+        ("LastSeen", timestamp_expr(&quote_ident("LastSeen"))),
+    ];
+    for column in duckdb_out::GEO_COLUMNS {
+        ddl.push_str(&format!(",\n         {column} VARCHAR"));
+        columns.push((column, text(column)));
+    }
+    duckdb_out::stage_and_type(&conn, "metrics", &ddl, &columns, &rows)?;
+
+    let mut meta = SuzakuMeta::new("aws-ct-metrics").with_geoip(geo_enabled);
+    meta.scanned_files = Some(scan.files as i64);
+    meta.scanned_events = Some(scan.events as i64);
+    meta.output_rows = Some(records.len() as i64);
+    duckdb_out::write_meta(&conn, &meta)?;
+    duckdb_out::comment_on_table(
+        &conn,
+        "metrics",
+        "One row per (Field, Value). Percent is that value's share of FieldTotal, the events \
+         counted for its Field; events that carried no value for the field are counted too, under \
+         Value IS NULL. Rows are an aggregation, so (Field, Value) is unique.",
+    )?;
+    for column in duckdb_out::GEO_COLUMNS {
+        duckdb_out::comment_on_column(&conn, "metrics", column, duckdb_out::GEO_COLUMN_COMMENT)?;
+    }
+    duckdb_out::checkpoint(&conn)
 }
 
 /// Print one table per field to stdout. The first column is named after the field, which is
@@ -649,6 +769,301 @@ mod tests {
         assert_eq!(csv_header(false).len(), 6);
         assert_eq!(csv_header(true).len(), 9);
         assert_eq!(csv_header(true)[8], "SrcCountry");
+    }
+
+    // -----------------------------------------------------------------------
+    // DuckDB 出力
+    // -----------------------------------------------------------------------
+
+    /// Write `fields` from [`EVENTS`] to a `.duckdb` in a temp dir and hand back the connection.
+    /// The `TempDir` comes back too because dropping it deletes the database.
+    fn duckdb_of(
+        fields: &[&str],
+        geo: Option<&mut GeoIPSearch>,
+    ) -> (tempfile::TempDir, Connection) {
+        let events: Vec<&str> = EVENTS.to_vec();
+        duckdb_of_events(fields, &events, geo)
+    }
+
+    fn duckdb_of_events(
+        fields: &[&str],
+        events: &[&str],
+        geo: Option<&mut GeoIPSearch>,
+    ) -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("result.duckdb");
+        let metrics = metrics_from(fields, events, true);
+        let geo_enabled = geo.is_some();
+        let records = build_records(&metrics, geo);
+        let scan = ScanStats {
+            files: 2,
+            events: events.len(),
+        };
+        write_duckdb_metrics(&path, &records, geo_enabled, scan).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        (tmp, conn)
+    }
+
+    fn column_type(conn: &Connection, column: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT data_type FROM duckdb_columns()
+             WHERE table_name = 'metrics' AND column_name = ?",
+            [column],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// P3: the two time columns are temporal, not text that happens to sort.
+    #[test]
+    fn duckdb_metrics_types_the_seen_timestamps() {
+        let (_tmp, conn) = duckdb_of(&["sourceIPAddress"], None);
+        assert_eq!(
+            column_type(&conn, "FirstSeen").as_deref(),
+            Some("TIMESTAMP")
+        );
+        assert_eq!(column_type(&conn, "LastSeen").as_deref(), Some("TIMESTAMP"));
+
+        let (first, last): (String, String) = conn
+            .query_row(
+                "SELECT strftime(FirstSeen, '%Y-%m-%d %H:%M:%S'),
+                        strftime(LastSeen, '%Y-%m-%d %H:%M:%S')
+                 FROM metrics WHERE Value = '1.1.1.1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, "2024-01-02 00:00:00");
+        assert_eq!(last, "2024-01-03 00:00:00");
+    }
+
+    /// P2: an event with no value for the field is NULL, not a placeholder that every consumer
+    /// has to remember to exclude. The row still exists — it is part of the denominator.
+    #[test]
+    fn duckdb_metrics_writes_null_for_a_missing_value() {
+        let (_tmp, conn) = duckdb_of(&["userIdentity.accessKeyId"], None);
+        let (nulls, placeholders): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*) FILTER (WHERE Value IS NULL),
+                        count(*) FILTER (WHERE Value IN ('', '-'))
+                 FROM metrics",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1, "the event without an access key must be NULL");
+        assert_eq!(placeholders, 0, "no text placeholder may survive");
+    }
+
+    /// P7: the CSV's two-decimal rendering makes `sum(Percent)` 99.03 instead of 100. The DuckDB
+    /// output stores the exact share and the denominator it came from.
+    #[test]
+    fn duckdb_metrics_percent_is_exact_and_carries_its_denominator() {
+        // Three events, so a rounded percentage cannot sum back to 100.
+        let (_tmp, conn) = duckdb_of(&["userIdentity.accessKeyId"], None);
+        let (total, rows, sum): (i64, i64, f64) = conn
+            .query_row(
+                "SELECT any_value(FieldTotal), count(*), sum(Percent) FROM metrics",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(total, EVENTS.len() as i64);
+        assert_eq!(rows, 3);
+        assert!((sum - 100.0).abs() < 1e-9, "sum(Percent) = {sum}");
+
+        // And Count is recoverable from Percent, which is what "full precision" has to mean.
+        let mismatched: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM metrics
+                 WHERE abs(Count - FieldTotal * Percent / 100.0) > 1e-9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mismatched, 0);
+    }
+
+    /// P6: `Field` keeps the CloudTrail path the user asked for, and names the timeline column
+    /// holding the same fact instead of being renamed to it.
+    #[test]
+    fn duckdb_metrics_names_the_timeline_column_for_each_field() {
+        let (_tmp, conn) = duckdb_of(&["sourceIPAddress", "eventName", "awsRegion"], None);
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT Field, TimelineColumn FROM metrics ORDER BY Field")
+            .unwrap();
+        let pairs: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                // The hyphen fix carries over: AWS-Region in the profile, AwsRegion in DuckDB.
+                ("awsRegion".to_string(), Some("AwsRegion".to_string())),
+                ("eventName".to_string(), Some("EventName".to_string())),
+                ("sourceIPAddress".to_string(), Some("SrcIP".to_string())),
+            ]
+        );
+    }
+
+    /// A path into an API-specific container has no timeline column, and saying so with NULL is
+    /// the whole reason `Field` was not renamed.
+    #[test]
+    fn duckdb_metrics_leaves_timeline_column_null_when_there_is_none() {
+        let events =
+            [r#"{"eventTime":"2024-01-01T00:00:00Z","requestParameters":{"bucketName":"logs"}}"#];
+        let (_tmp, conn) = duckdb_of_events(&["requestParameters.bucketName"], &events, None);
+        let column: Option<String> = conn
+            .query_row("SELECT TimelineColumn FROM metrics", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(column, None);
+    }
+
+    /// P8: the geo columns are part of the schema whether or not `-G` ran, so one query works
+    /// against every file. `suzaku_meta.geoip_enabled` is what says why they are NULL.
+    #[test]
+    fn duckdb_metrics_always_has_geo_columns() {
+        let (_tmp, conn) = duckdb_of(&["sourceIPAddress"], None);
+        assert_eq!(column_type(&conn, "SrcCountry").as_deref(), Some("VARCHAR"));
+        let (enriched, geoip_enabled): (i64, bool) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM metrics WHERE SrcCountry IS NOT NULL),
+                        (SELECT geoip_enabled FROM suzaku_meta)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enriched, 0);
+        assert!(!geoip_enabled);
+
+        let mut geo = GeoIPSearch::new(Path::new("test_files/mmdb"))
+            .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/");
+        let events = [
+            r#"{"eventTime":"2024-01-01T00:00:00Z","sourceIPAddress":"81.2.69.142"}"#,
+            r#"{"eventTime":"2024-01-01T00:00:00Z","sourceIPAddress":"cloudtrail.amazonaws.com"}"#,
+        ];
+        let (_tmp, conn) = duckdb_of_events(&["sourceIPAddress"], &events, Some(&mut geo));
+        let geoip_enabled: bool = conn
+            .query_row("SELECT geoip_enabled FROM suzaku_meta", [], |r| r.get(0))
+            .unwrap();
+        assert!(geoip_enabled);
+
+        let country: Option<String> = conn
+            .query_row(
+                "SELECT SrcCountry FROM metrics WHERE Value = '81.2.69.142'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(country.as_deref(), Some("United Kingdom"));
+        // A value that is not an IP could not be enriched: NULL, not a placeholder.
+        let unenriched: Option<String> = conn
+            .query_row(
+                "SELECT SrcCountry FROM metrics WHERE Value = 'cloudtrail.amazonaws.com'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unenriched, None);
+    }
+
+    /// P1: the file states which command, version and coverage produced it.
+    #[test]
+    fn duckdb_metrics_writes_self_describing_metadata() {
+        let (_tmp, conn) = duckdb_of(&["eventName"], None);
+        let (version, command, tz, files, events, rows, dupes): (
+            i32,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT schema_version, command, timestamp_tz, scanned_files, scanned_events,
+                        output_rows, duplicate_rows_removed
+                 FROM suzaku_meta",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(version, duckdb_out::SCHEMA_VERSION);
+        assert_eq!(command, "aws-ct-metrics");
+        assert_eq!(tz, "UTC");
+        assert_eq!(files, 2);
+        assert_eq!(events, EVENTS.len() as i64);
+        assert_eq!(rows, 2, "ListBuckets and DeleteTrail");
+        // The rows are an aggregation, so there is nothing to deduplicate.
+        assert_eq!(dupes, None);
+
+        let meta_rows: i64 = conn
+            .query_row("SELECT count(*) FROM suzaku_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(meta_rows, 1);
+
+        // P9: the grain is readable from the file itself, not only from the docs.
+        let comment: Option<String> = conn
+            .query_row(
+                "SELECT comment FROM duckdb_tables() WHERE table_name = 'metrics'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            comment.unwrap_or_default().contains("(Field, Value)"),
+            "the metrics table must document its grain"
+        );
+    }
+
+    /// P10: a database left with an unreplayed WAL cannot be opened from a read-only mount.
+    #[test]
+    fn duckdb_metrics_leaves_no_wal_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("result.duckdb");
+        let metrics = metrics_from(&["eventName"], &EVENTS, true);
+        let records = build_records(&metrics, None);
+        write_duckdb_metrics(&path, &records, false, ScanStats::default()).unwrap();
+
+        let wal = tmp.path().join("result.duckdb.wal");
+        assert!(
+            !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
+            "the checkpoint on exit must leave no work in the WAL"
+        );
+        let cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .unwrap();
+        let ro = Connection::open_with_flags(&path, cfg).unwrap();
+        assert_eq!(
+            ro.query_row("SELECT count(*) FROM metrics", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    /// The DuckDB output is a different rendering of the same records, not a different dataset:
+    /// unlike the timeline it drops nothing, so the row counts must agree with the CSV's.
+    #[test]
+    fn duckdb_metrics_row_count_matches_the_records() {
+        let metrics = metrics_from(&["eventName", "sourceIPAddress"], &EVENTS, true);
+        let expected = build_records(&metrics, None).len() as i64;
+        let (_tmp, conn) = duckdb_of(&["eventName", "sourceIPAddress"], None);
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM metrics", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, expected);
     }
 
     #[test]

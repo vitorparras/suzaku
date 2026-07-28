@@ -75,3 +75,56 @@ RuleID: 'sigma.id'
 * Currently we only support strings but plan on supporting other types of field values.
 
 > Note: If you want to output the original JSON data and make sure you do not loose any field information, just add the `-R, --raw-output` option to `aws-ct-timeline` command.
+
+### DuckDB output schema
+
+The CSV and JSON outputs are a *rendering* of the profile above; the DuckDB output is a *data
+interface*, so it is typed and self-describing instead. The differences are deliberate and apply
+to `aws-ct-timeline`, `azure-timeline` and `aws-ct-search`:
+
+| | CSV / JSON | DuckDB |
+|---|---|---|
+| A missing value | `-` (or empty) | `NULL` |
+| `Timestamp` | rendered text | `TIMESTAMP` |
+| `Level` | text | `suzaku_level`, an `ENUM` ordered by severity |
+| `AWS-Region` | `AWS-Region` | `AwsRegion` (no quoting needed in SQL) |
+| `Tags` | one ` ¦ `-joined string | `Tactics`, `TechniqueIDs`, `OtherTags`, each a `VARCHAR[]` |
+| `SrcASN` / `SrcCity` / `SrcCountry` | added only under `-G, --geo-ip` | always present (when the profile has `SrcIP`), `NULL` when `-G` was not used |
+| Duplicate rows | kept | exact duplicates removed, count reported in `suzaku_meta` |
+
+Every file also carries a one-row `suzaku_meta` table so a reader can tell what produced it
+without guessing:
+
+| Column | Meaning |
+|---|---|
+| `schema_version` | Layout version. Check this before reading the other tables. |
+| `suzaku_version`, `command`, `command_line` | Which Suzaku, which subcommand, which exact invocation. |
+| `generated_at` | When the file was written. |
+| `timestamp_tz` | The zone the `Timestamp` column is expressed in — `UTC`, or the local offset under `-l, --localtime`. |
+| `rules_version`, `rules_count` | Ruleset revision (when the rules folder is a git checkout) and how many rules were loaded. |
+| `geoip_enabled` | Whether `-G, --geo-ip` ran. Tells an all-`NULL` `SrcCountry` ("enrichment was off") apart from a `NULL` cell in an enriched file ("this value is not an IP address"). |
+| `scanned_files`, `scanned_events` | Coverage of the run. |
+| `output_rows`, `duplicate_rows_removed` | Rows written, and exact duplicates dropped on write. |
+
+A `timeline` row is one **event × rule match**: an event matching several rules produces one row
+per match, so `EventID` is *not* unique. That grain is also recorded as a table comment
+(`SELECT comment FROM duckdb_tables()`).
+
+```sql
+-- Critical and high alerts in a time range, with their ATT&CK techniques.
+-- `Level` is an ENUM, so cast the literal to compare by severity rather than alphabetically.
+SELECT Timestamp, RuleTitle, EventName, SrcIP, TechniqueIDs
+FROM timeline
+WHERE Level >= 'high'::suzaku_level
+  AND Timestamp BETWEEN TIMESTAMP '2024-01-01' AND TIMESTAMP '2024-02-01'
+  AND ErrorCode IS NULL          -- the call succeeded
+ORDER BY Timestamp;
+
+-- ATT&CK technique coverage, no string parsing required
+SELECT technique, count(*) AS hits
+FROM (SELECT unnest(TechniqueIDs) AS technique FROM timeline)
+GROUP BY 1 ORDER BY hits DESC;
+```
+
+The database is checkpointed before Suzaku exits, so the `.duckdb` file is complete and can be
+opened read-only (copy it after the command finishes, not while it runs).

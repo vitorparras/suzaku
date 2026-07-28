@@ -1,4 +1,5 @@
 pub mod color;
+pub mod duckdb_out;
 pub mod errorlog;
 pub(crate) mod log_source;
 pub mod rules;
