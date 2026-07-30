@@ -1455,6 +1455,202 @@ mod tests {
         );
     }
 
+    /// Drives the real `write_record` path -- the shipped profile from `load_profile`, the
+    /// profile-derived `SrcIP` spec, the CSV writer -- and returns the emitted row as a map.
+    ///
+    /// The point is to bind the profile to the enrichment. `geoip_resolves_source_ip_via_profile_spec`
+    /// passes literal specs straight to `get_value_from_event`, so hardcoding a field name back
+    /// into `write_record` (which is where #159 actually lived) would leave every assertion there
+    /// green. Verified by mutation: replacing `src_ip_spec(context.profile)` at the top of
+    /// `write_record` with a literal `".sourceIPAddress"` fails this test and nothing else in the
+    /// suite.
+    fn write_record_columns(
+        log: &crate::core::log_source::LogSource,
+        event_json: &str,
+        geo: &mut Option<crate::option::geoip::GeoIPSearch>,
+    ) -> std::collections::HashMap<String, String> {
+        use crate::core::util::load_profile;
+        use sigma_rust::{event_from_json, rule_from_yaml};
+
+        let profile = load_profile(log, geo, true);
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let event = event_from_json(event_json).unwrap();
+        let json: Value = serde_json::from_str(event_json).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("out.csv");
+        let config = OutputConfig::new(true, false, false);
+        {
+            let file = std::fs::File::create(&csv_path).unwrap();
+            let writers = Writers::new()
+                .with_csv(csv::WriterBuilder::new().from_writer(Box::new(file) as Box<dyn Write>));
+            let mut context = OutputContext::new(&profile, geo, &config, writers, &[]);
+            write_record(&event, &json, Some(&rule), &mut context);
+            context.flush_all();
+        }
+
+        let text = std::fs::read_to_string(&csv_path).unwrap();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(text.as_bytes());
+        let row: Vec<String> = reader
+            .records()
+            .next()
+            .expect("write_record emitted no CSV row")
+            .unwrap()
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        profile.iter().map(|(k, _)| k.clone()).zip(row).collect()
+    }
+
+    // #159 must stay fixed at the level it actually broke: the profile. The test above pins the
+    // resolution given a spec; this one pins that the shipped Azure/M365 profile is what supplies
+    // that spec, end to end through `write_record`.
+    #[test]
+    fn write_record_enriches_geoip_from_the_shipped_profile() {
+        use crate::core::log_source::LogSource;
+        use crate::option::geoip::GeoIPSearch;
+        use std::path::Path;
+
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+
+        // Azure: the caller IP lives in `callerIpAddress`, a field name that does not exist in
+        // CloudTrail. This is the exact record shape #159 reported as always rendering "-".
+        let azure = write_record_columns(
+            &LogSource::Azure,
+            r#"{"callerIpAddress": "89.160.20.112", "eventName": "E", "operationName": "op"}"#,
+            &mut geo,
+        );
+        assert_eq!(
+            azure.get("SrcIP").map(String::as_str),
+            Some("89.160.20.112")
+        );
+        assert_eq!(
+            azure.get("SrcASN").map(String::as_str),
+            Some("Bredband2 AB")
+        );
+        assert_eq!(azure.get("SrcCity").map(String::as_str), Some("Linköping"));
+        assert_eq!(azure.get("SrcCountry").map(String::as_str), Some("Sweden"));
+
+        // AWS through the same path, so a regression that breaks one log source and not the other
+        // is still caught.
+        let aws = write_record_columns(
+            &LogSource::Aws,
+            r#"{"sourceIPAddress": "89.160.20.112", "eventName": "E"}"#,
+            &mut geo,
+        );
+        assert_eq!(aws.get("SrcASN").map(String::as_str), Some("Bredband2 AB"));
+        assert_eq!(aws.get("SrcCountry").map(String::as_str), Some("Sweden"));
+    }
+
+    /// The correlation sibling of `write_record_columns`: drives `write_correlation_record`,
+    /// which builds its row through `get_value_from_correlation_event` and computes the spec at a
+    /// *different* call site (`build_correlation_record`). A hardcode there would be invisible to
+    /// the non-correlation tests.
+    fn write_correlation_columns(
+        log: &crate::core::log_source::LogSource,
+        event_json: &str,
+        geo: &mut Option<crate::option::geoip::GeoIPSearch>,
+    ) -> std::collections::HashMap<String, String> {
+        use crate::core::util::load_profile;
+        use sigma_rust::{SigmaCorrelationRule, TimestampedEvent, event_from_json, rule_from_yaml};
+
+        let profile = load_profile(log, geo, true);
+        let base_rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let correlation_rule = SigmaCorrelationRule {
+            title: "c".to_string(),
+            ..Default::default()
+        };
+        let timestamped = TimestampedEvent {
+            event: event_from_json(event_json).unwrap(),
+            timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
+            rule: &base_rule,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("out.csv");
+        let config = OutputConfig::new(true, false, false);
+        {
+            let file = std::fs::File::create(&csv_path).unwrap();
+            let writers = Writers::new()
+                .with_csv(csv::WriterBuilder::new().from_writer(Box::new(file) as Box<dyn Write>));
+            let mut context = OutputContext::new(&profile, geo, &config, writers, &[]);
+            write_correlation_record(&vec![&timestamped], &correlation_rule, &mut context);
+            context.flush_all();
+        }
+
+        let text = std::fs::read_to_string(&csv_path).unwrap();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(text.as_bytes());
+        let row: Vec<String> = reader
+            .records()
+            .next()
+            .expect("write_correlation_record emitted no CSV row")
+            .unwrap()
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        profile.iter().map(|(k, _)| k.clone()).zip(row).collect()
+    }
+
+    // Correlation rows go through their own record builder and their own `src_ip_spec` call, so
+    // #159 could regress there alone. Verified by mutation: hardcoding the spec inside
+    // `build_correlation_record` fails this test and nothing else.
+    #[test]
+    fn write_correlation_record_enriches_geoip_from_the_shipped_profile() {
+        use crate::option::geoip::GeoIPSearch;
+        use std::path::Path;
+
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+        let azure = write_correlation_columns(
+            &crate::core::log_source::LogSource::Azure,
+            r#"{"callerIpAddress": "89.160.20.112", "eventName": "E", "operationName": "op"}"#,
+            &mut geo,
+        );
+        assert_eq!(
+            azure.get("SrcASN").map(String::as_str),
+            Some("Bredband2 AB")
+        );
+        assert_eq!(azure.get("SrcCountry").map(String::as_str), Some("Sweden"));
+    }
+
+    // Without -G the profile has no geo columns at all, so the enrichment above cannot be an
+    // artifact of columns that are always present.
+    #[test]
+    fn write_record_omits_geo_columns_without_geoip() {
+        use crate::core::log_source::LogSource;
+        let mut geo = None;
+        let azure = write_record_columns(
+            &LogSource::Azure,
+            r#"{"callerIpAddress": "89.160.20.112", "eventName": "E", "operationName": "op"}"#,
+            &mut geo,
+        );
+        assert_eq!(
+            azure.get("SrcIP").map(String::as_str),
+            Some("89.160.20.112")
+        );
+        for key in ["SrcASN", "SrcCity", "SrcCountry"] {
+            assert!(
+                !azure.contains_key(key),
+                "{key} must not be emitted without -G"
+            );
+        }
+    }
+
     /// The full AWS timeline profile, so the schema assertions below run against the real
     /// column set rather than a hand-picked subset.
     fn aws_profile_keys() -> Vec<String> {
