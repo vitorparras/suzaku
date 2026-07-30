@@ -32,6 +32,23 @@ fn ipv6_in_range(ip: &Ipv6Addr, network: u128, prefix: u32) -> bool {
     (u128::from(*ip) & mask) == (network & mask)
 }
 
+/// Parses a log field into an IP address, unwrapping the IPv4-mapped IPv6 form
+/// (`::ffff:1.2.3.4`) that some sources write. Returns `None` for anything that is not an
+/// address — an empty string, a `-` placeholder, a `host:port` pair, or a service principal such
+/// as `cloudtrail.amazonaws.com`.
+///
+/// Free-standing rather than a `GeoIPSearch` method so the `SrcIP` column can pick the same
+/// candidate the GeoIP lookup will, whether or not `-G` was given. `GeoIPSearch::convert`
+/// delegates here, so the two can never drift apart.
+pub fn parse_ip(value: &str) -> Option<IpAddr> {
+    let value = if value.starts_with("::ffff:") {
+        value.replace("::ffff:", "")
+    } else {
+        value.to_string()
+    };
+    IpAddr::from_str(&value).ok()
+}
+
 pub fn is_private_ip(target_ip: &IpAddr) -> bool {
     match target_ip {
         IpAddr::V4(ip) => ip.is_private(),
@@ -67,15 +84,7 @@ impl GeoIPSearch {
     }
 
     pub fn convert(&self, ip: &str) -> Option<IpAddr> {
-        let ip = if ip.starts_with("::ffff:") {
-            ip.replace("::ffff:", "")
-        } else {
-            ip.to_string()
-        };
-        if let Ok(ip) = IpAddr::from_str(&ip) {
-            return Some(ip);
-        }
-        None
+        parse_ip(ip)
     }
 
     pub fn get_asn(&mut self, ip: IpAddr) -> String {
