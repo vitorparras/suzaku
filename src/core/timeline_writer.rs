@@ -7,7 +7,7 @@ use crate::core::duckdb_out::{
 use crate::core::errorlog::log_error;
 use crate::core::util::{get_json_writer, get_writer, sanitize_csv_field};
 use crate::option::cli::OutputFormat;
-use crate::option::geoip::GeoIPSearch;
+use crate::option::geoip::{GeoIPSearch, parse_ip};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use csv::Writer;
 use duckdb::{Connection, ToSql};
@@ -16,6 +16,7 @@ use serde_json::Value;
 use sigma_rust::{Event, Rule, SigmaCorrelationRule, TimestampedEvent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use termcolor::{BufferWriter, ColorChoice, ColorSpec, WriteColor};
 
@@ -731,6 +732,38 @@ fn src_ip_spec(profile: &[(String, String)]) -> &str {
         .unwrap_or("")
 }
 
+/// Picks the source IP out of a `|`-separated `SrcIP` field spec.
+///
+/// Returns the chosen field's raw value together with its parsed form. The first candidate that
+/// PARSES as an IP wins; if none does, the first candidate merely present is returned with no
+/// parsed form, so the `SrcIP` column still shows what the log recorded (an AWS-service event
+/// writes `cloudtrail.amazonaws.com` there, and that is worth displaying even though it cannot be
+/// geolocated).
+///
+/// One selector for both the `SrcIP` column and the three geo columns, so they always describe
+/// the same field. Choosing per-column would let `SrcIP` display one address while
+/// `SrcCountry` described another.
+fn select_source_ip(spec: &str, event: &Event) -> Option<(String, Option<IpAddr>)> {
+    let mut first_present: Option<String> = None;
+    for key in spec
+        .split('|')
+        .map(|k| k.trim_matches('.').trim())
+        .filter(|k| !k.is_empty())
+    {
+        let Some(value) = event.get(key) else {
+            continue;
+        };
+        let raw = value.value_to_string();
+        if let Some(ip) = parse_ip(&raw) {
+            return Some((raw, Some(ip)));
+        }
+        if first_present.is_none() {
+            first_present = Some(raw);
+        }
+    }
+    first_present.map(|raw| (raw, None))
+}
+
 fn get_value_from_event_common(
     key: &str,
     event: &Event,
@@ -741,30 +774,43 @@ fn get_value_from_event_common(
 ) -> String {
     // GeoIP処理部分（共通）: only the three geo columns are enriched. The source IP
     // is resolved from the profile's SrcIP field spec (`.sourceIPAddress` for AWS,
-    // `.callerIpAddress|.ClientIP|...` for Azure/M365) — NOT a hardcoded field name
-    // — so Azure/M365 enrich just like AWS. A missing GeoIP DB, a missing source IP,
-    // or a non-IP value (e.g. a service principal like "cloudtrail.amazonaws.com")
-    // yields the "-" placeholder for those columns only — it must never overwrite
-    // an unrelated column's value.
+    // `.claims.ipaddr|.callerIpAddress|.ClientIP|...` for Azure/M365) — NOT a hardcoded
+    // field name — so Azure/M365 enrich just like AWS. A missing GeoIP DB, no usable
+    // source IP, or a non-IP value (e.g. a service principal like
+    // "cloudtrail.amazonaws.com") yields the "-" placeholder for those columns only —
+    // it must never overwrite an unrelated column's value.
+    //
+    // The spec is a fallback list, so the search takes the first candidate that PARSES
+    // as an IP, not merely the first that exists. Stopping at the first present key
+    // meant an earlier candidate holding "", "-", a host:port pair or any other non-IP
+    // ended the lookup, and a valid address in a later field was never consulted — the
+    // geo columns then rendered "-" for a record that plainly carried a routable IP
+    // (issue #183). Azure records commonly have `claims.ipaddr` absent-or-empty while
+    // `callerIpAddress` is populated, so this was reachable on ordinary input.
+    //
+    // The `SrcIP` column resolves through the same selector, so the address displayed
+    // and the address geolocated are always the same field.
     if matches!(key, "SrcASN" | "SrcCity" | "SrcCountry") {
         if let Some(geo) = geo_ip {
-            let ip_value = src_ip
-                .split('|')
-                .map(|k| k.trim_matches('.').trim())
-                .filter(|k| !k.is_empty())
-                .find_map(|k| event.get(k));
-            if let Some(ip) = ip_value {
-                let ip = ip.value_to_string();
-                if let Some(ip) = geo.convert(ip.as_str()) {
-                    return match key {
-                        "SrcASN" => geo.get_asn(ip),
-                        "SrcCity" => geo.get_city(ip),
-                        _ => geo.get_country(ip),
-                    };
-                }
+            let resolved = select_source_ip(src_ip, event).and_then(|(_, ip)| ip);
+            if let Some(ip) = resolved {
+                return match key {
+                    "SrcASN" => geo.get_asn(ip),
+                    "SrcCity" => geo.get_city(ip),
+                    _ => geo.get_country(ip),
+                };
             }
         }
         return "-".to_string();
+    }
+    // The SrcIP column resolves through the same selector as the geo columns above, so the
+    // address displayed is always the one that was (or would have been) geolocated. Without this
+    // the generic resolver below would show the first field merely PRESENT, letting SrcIP report
+    // one address while SrcCountry described another (#183).
+    if !src_ip.is_empty() && key == src_ip {
+        return select_source_ip(src_ip, event)
+            .map(|(raw, _)| raw)
+            .unwrap_or_else(|| "-".to_string());
     }
     // イベントフィールド処理（共通）
     if key.starts_with(".") {
@@ -1353,6 +1399,138 @@ mod tests {
         );
     }
 
+    // #183: the SrcIP spec is a fallback list, so an earlier candidate that exists but holds
+    // nothing usable must not end the search. Before the fix `find_map(event.get)` committed to
+    // the first PRESENT key and parsing happened afterwards, so each case below rendered "-"
+    // even though a routable address sat in the next field.
+    #[test]
+    fn geoip_skips_unusable_candidates_and_takes_the_first_parseable_one() {
+        use crate::option::geoip::GeoIPSearch;
+        use sigma_rust::{event_from_json, rule_from_yaml};
+        use std::path::Path;
+
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+        let spec = ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress";
+
+        // Every shape an earlier candidate can take while a later one holds a real address.
+        // "89.160.20.112:443" is the M365 UAL `ClientIP` host:port form, the likeliest trigger.
+        for first in [
+            "\"\"",
+            "\"-\"",
+            "\"not-an-ip\"",
+            "\"89.160.20.112:443\"",
+            "null",
+        ] {
+            let event = event_from_json(&format!(
+                r#"{{"claims": {{"ipaddr": {first}}}, "callerIpAddress": "89.160.20.112", "eventName": "E"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                get_value_from_event("SrcCountry", &event, Some(&rule), &mut geo, false, spec),
+                "Sweden",
+                "an unusable first candidate ({first}) must not end the search"
+            );
+        }
+
+        // A usable earlier candidate still wins -- the search takes the FIRST parseable value,
+        // it does not simply prefer whichever field resolves in the database.
+        let both = event_from_json(
+            r#"{"claims": {"ipaddr": "81.2.69.144"}, "callerIpAddress": "89.160.20.112", "eventName": "E"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_value_from_event("SrcCity", &both, Some(&rule), &mut geo, false, spec),
+            "London",
+            "the first parseable candidate must win, not a later one"
+        );
+
+        // Nothing usable anywhere still yields the placeholder rather than enriching from an
+        // unrelated field.
+        let none = event_from_json(
+            r#"{"claims": {"ipaddr": "not-an-ip"}, "callerIpAddress": "also-not-an-ip", "eventName": "E"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_value_from_event("SrcCountry", &none, Some(&rule), &mut geo, false, spec),
+            "-"
+        );
+    }
+
+    // The SrcIP column and the geo columns must always describe the SAME field. They are
+    // resolved by one selector for exactly this reason; resolving them separately let SrcIP show
+    // an unusable earlier candidate while the geo columns described a later, valid one.
+    #[test]
+    fn src_ip_column_and_geo_columns_describe_the_same_field() {
+        use crate::option::geoip::GeoIPSearch;
+        use sigma_rust::{event_from_json, rule_from_yaml};
+        use std::path::Path;
+
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+        let spec = ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress";
+        let value = |key: &str, event: &sigma_rust::Event, geo: &mut _| {
+            get_value_from_event(key, event, Some(&rule), geo, false, spec)
+        };
+
+        // An unusable first candidate: SrcIP must show the address that was geolocated, not the
+        // junk that could not be.
+        for first in [
+            "\"\"",
+            "\"-\"",
+            "\"not-an-ip\"",
+            "\"89.160.20.112:443\"",
+            "null",
+        ] {
+            let event = event_from_json(&format!(
+                r#"{{"claims": {{"ipaddr": {first}}}, "callerIpAddress": "89.160.20.112", "eventName": "E"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                value(spec, &event, &mut geo),
+                "89.160.20.112",
+                "SrcIP must show the field the geo columns resolved (first candidate {first})"
+            );
+            assert_eq!(value("SrcCountry", &event, &mut geo), "Sweden");
+        }
+
+        // When nothing parses, SrcIP still reports what the log recorded and the geo columns say
+        // so -- they agree that the displayed value could not be geolocated. This is the routine
+        // AWS-service case.
+        let service = event_from_json(
+            r#"{"claims": {"ipaddr": "cloudtrail.amazonaws.com"}, "eventName": "E"}"#,
+        )
+        .unwrap();
+        assert_eq!(value(spec, &service, &mut geo), "cloudtrail.amazonaws.com");
+        assert_eq!(value("SrcCountry", &service, &mut geo), "-");
+
+        // No candidate at all: the placeholder, not an empty cell.
+        let empty = event_from_json(r#"{"eventName": "E"}"#).unwrap();
+        assert_eq!(value(spec, &empty, &mut geo), "-");
+        assert_eq!(value("SrcCountry", &empty, &mut geo), "-");
+
+        // The column behaves the same without -G, so enabling GeoIP never changes which address
+        // SrcIP displays.
+        let mut no_geo = None;
+        let event = event_from_json(
+            r#"{"claims": {"ipaddr": ""}, "callerIpAddress": "89.160.20.112", "eventName": "E"}"#,
+        )
+        .unwrap();
+        assert_eq!(value(spec, &event, &mut no_geo), "89.160.20.112");
+    }
+
     #[test]
     fn src_ip_spec_reads_profile_srcip_field() {
         let aws = vec![
@@ -1376,6 +1554,14 @@ mod tests {
     // spec, so an Azure `callerIpAddress` enriches identically to an AWS
     // `sourceIPAddress`. Before the fix the Azure field was ignored (the lookup
     // hardcoded `sourceIPAddress`) and the geo columns were always "-".
+    //
+    // The IP must be one the checked-in GeoLite2 *test* databases actually contain --
+    // they are MaxMind's small fixtures, not the real feeds, and resolve only a handful
+    // of ranges. 89.160.20.112 is in all three (ASN "Bredband2 AB", city Linköping,
+    // country Sweden). An IP outside them, such as a public resolver address, makes
+    // every branch return "-" and the assertions stop distinguishing the fix from the
+    // bug: verified by mutation that with the hardcoded `event.get("sourceIPAddress")`
+    // restored, this test fails on the Azure lookups below and passed before this change.
     #[test]
     fn geoip_resolves_source_ip_via_profile_spec() {
         use crate::option::geoip::GeoIPSearch;
@@ -1386,7 +1572,8 @@ mod tests {
             "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
         )
         .unwrap();
-        let ip = "8.8.8.8";
+        // Present in test_files/mmdb for all three databases.
+        let ip = "89.160.20.112";
         let aws_event = event_from_json(&format!(
             r#"{{"sourceIPAddress": "{ip}", "eventName": "E"}}"#
         ))
@@ -1400,27 +1587,245 @@ mod tests {
             GeoIPSearch::new(Path::new("test_files/mmdb"))
                 .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
         );
-        let aws_country = get_value_from_event(
-            "SrcCountry",
-            &aws_event,
-            Some(&rule),
-            &mut geo,
-            false,
-            ".sourceIPAddress",
+        let lookup = |key: &str, event: &sigma_rust::Event, spec: &str, geo: &mut _| {
+            get_value_from_event(key, event, Some(&rule), geo, false, spec)
+        };
+
+        // The AWS field enriches -- this is the control. If these ever go back to "-" the
+        // test databases have changed and the assertions below would stop meaning anything.
+        assert_eq!(
+            lookup("SrcCountry", &aws_event, ".sourceIPAddress", &mut geo),
+            "Sweden",
+            "the control lookup must enrich; is 89.160.20.112 still in test_files/mmdb?"
         );
-        let azure_country = get_value_from_event(
-            "SrcCountry",
-            &azure_event,
-            Some(&rule),
-            &mut geo,
-            false,
-            ".callerIpAddress",
+
+        // The Azure field must enrich identically, resolved through the profile's spec
+        // rather than a hardcoded AWS field name. Each of the three geo columns is checked
+        // because they are three separate lookups against three separate databases.
+        assert_eq!(
+            lookup("SrcCountry", &azure_event, ".callerIpAddress", &mut geo),
+            "Sweden"
         );
-        // Same IP + same DB must enrich identically regardless of the field name.
-        assert_eq!(aws_country, azure_country);
-        // When the DB actually resolves the IP, the Azure field must enrich (not "-").
-        if aws_country != "-" {
-            assert_ne!(azure_country, "-");
+        assert_eq!(
+            lookup("SrcASN", &azure_event, ".callerIpAddress", &mut geo),
+            "Bredband2 AB"
+        );
+        assert_eq!(
+            lookup("SrcCity", &azure_event, ".callerIpAddress", &mut geo),
+            "Linköping"
+        );
+
+        // The real Azure/M365 profile declares a `|`-separated fallback list; the field
+        // that is actually present must be found wherever it sits in that list.
+        let azure_spec = ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress";
+        assert_eq!(
+            lookup("SrcCountry", &azure_event, azure_spec, &mut geo),
+            "Sweden",
+            "a later candidate in the SrcIP spec must still be found"
+        );
+
+        // A profile with no SrcIP column, or an event carrying none of the candidates,
+        // yields the placeholder rather than enriching from some unrelated field.
+        assert_eq!(lookup("SrcCountry", &azure_event, "", &mut geo), "-");
+        assert_eq!(
+            lookup("SrcCountry", &aws_event, ".callerIpAddress", &mut geo),
+            "-"
+        );
+    }
+
+    /// Drives the real `write_record` path -- the shipped profile from `load_profile`, the
+    /// profile-derived `SrcIP` spec, the CSV writer -- and returns the emitted row as a map.
+    ///
+    /// The point is to bind the profile to the enrichment. `geoip_resolves_source_ip_via_profile_spec`
+    /// passes literal specs straight to `get_value_from_event`, so hardcoding a field name back
+    /// into `write_record` (which is where #159 actually lived) would leave every assertion there
+    /// green. Verified by mutation: replacing `src_ip_spec(context.profile)` at the top of
+    /// `write_record` with a literal `".sourceIPAddress"` fails this test and nothing else in the
+    /// suite.
+    fn write_record_columns(
+        log: &crate::core::log_source::LogSource,
+        event_json: &str,
+        geo: &mut Option<crate::option::geoip::GeoIPSearch>,
+    ) -> std::collections::HashMap<String, String> {
+        use crate::core::util::load_profile;
+        use sigma_rust::{event_from_json, rule_from_yaml};
+
+        let profile = load_profile(log, geo, true);
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let event = event_from_json(event_json).unwrap();
+        let json: Value = serde_json::from_str(event_json).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("out.csv");
+        let config = OutputConfig::new(true, false, false);
+        {
+            let file = std::fs::File::create(&csv_path).unwrap();
+            let writers = Writers::new()
+                .with_csv(csv::WriterBuilder::new().from_writer(Box::new(file) as Box<dyn Write>));
+            let mut context = OutputContext::new(&profile, geo, &config, writers, &[]);
+            write_record(&event, &json, Some(&rule), &mut context);
+            context.flush_all();
+        }
+
+        let text = std::fs::read_to_string(&csv_path).unwrap();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(text.as_bytes());
+        let row: Vec<String> = reader
+            .records()
+            .next()
+            .expect("write_record emitted no CSV row")
+            .unwrap()
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        profile.iter().map(|(k, _)| k.clone()).zip(row).collect()
+    }
+
+    // #159 must stay fixed at the level it actually broke: the profile. The test above pins the
+    // resolution given a spec; this one pins that the shipped Azure/M365 profile is what supplies
+    // that spec, end to end through `write_record`.
+    #[test]
+    fn write_record_enriches_geoip_from_the_shipped_profile() {
+        use crate::core::log_source::LogSource;
+        use crate::option::geoip::GeoIPSearch;
+        use std::path::Path;
+
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+
+        // Azure: the caller IP lives in `callerIpAddress`, a field name that does not exist in
+        // CloudTrail. This is the exact record shape #159 reported as always rendering "-".
+        let azure = write_record_columns(
+            &LogSource::Azure,
+            r#"{"callerIpAddress": "89.160.20.112", "eventName": "E", "operationName": "op"}"#,
+            &mut geo,
+        );
+        assert_eq!(
+            azure.get("SrcIP").map(String::as_str),
+            Some("89.160.20.112")
+        );
+        assert_eq!(
+            azure.get("SrcASN").map(String::as_str),
+            Some("Bredband2 AB")
+        );
+        assert_eq!(azure.get("SrcCity").map(String::as_str), Some("Linköping"));
+        assert_eq!(azure.get("SrcCountry").map(String::as_str), Some("Sweden"));
+
+        // AWS through the same path, so a regression that breaks one log source and not the other
+        // is still caught.
+        let aws = write_record_columns(
+            &LogSource::Aws,
+            r#"{"sourceIPAddress": "89.160.20.112", "eventName": "E"}"#,
+            &mut geo,
+        );
+        assert_eq!(aws.get("SrcASN").map(String::as_str), Some("Bredband2 AB"));
+        assert_eq!(aws.get("SrcCountry").map(String::as_str), Some("Sweden"));
+    }
+
+    /// The correlation sibling of `write_record_columns`: drives `write_correlation_record`,
+    /// which builds its row through `get_value_from_correlation_event` and computes the spec at a
+    /// *different* call site (`build_correlation_record`). A hardcode there would be invisible to
+    /// the non-correlation tests.
+    fn write_correlation_columns(
+        log: &crate::core::log_source::LogSource,
+        event_json: &str,
+        geo: &mut Option<crate::option::geoip::GeoIPSearch>,
+    ) -> std::collections::HashMap<String, String> {
+        use crate::core::util::load_profile;
+        use sigma_rust::{SigmaCorrelationRule, TimestampedEvent, event_from_json, rule_from_yaml};
+
+        let profile = load_profile(log, geo, true);
+        let base_rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let correlation_rule = SigmaCorrelationRule {
+            title: "c".to_string(),
+            ..Default::default()
+        };
+        let timestamped = TimestampedEvent {
+            event: event_from_json(event_json).unwrap(),
+            timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
+            rule: &base_rule,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("out.csv");
+        let config = OutputConfig::new(true, false, false);
+        {
+            let file = std::fs::File::create(&csv_path).unwrap();
+            let writers = Writers::new()
+                .with_csv(csv::WriterBuilder::new().from_writer(Box::new(file) as Box<dyn Write>));
+            let mut context = OutputContext::new(&profile, geo, &config, writers, &[]);
+            write_correlation_record(&vec![&timestamped], &correlation_rule, &mut context);
+            context.flush_all();
+        }
+
+        let text = std::fs::read_to_string(&csv_path).unwrap();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(text.as_bytes());
+        let row: Vec<String> = reader
+            .records()
+            .next()
+            .expect("write_correlation_record emitted no CSV row")
+            .unwrap()
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        profile.iter().map(|(k, _)| k.clone()).zip(row).collect()
+    }
+
+    // Correlation rows go through their own record builder and their own `src_ip_spec` call, so
+    // #159 could regress there alone. Verified by mutation: hardcoding the spec inside
+    // `build_correlation_record` fails this test and nothing else.
+    #[test]
+    fn write_correlation_record_enriches_geoip_from_the_shipped_profile() {
+        use crate::option::geoip::GeoIPSearch;
+        use std::path::Path;
+
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+        let azure = write_correlation_columns(
+            &crate::core::log_source::LogSource::Azure,
+            r#"{"callerIpAddress": "89.160.20.112", "eventName": "E", "operationName": "op"}"#,
+            &mut geo,
+        );
+        assert_eq!(
+            azure.get("SrcASN").map(String::as_str),
+            Some("Bredband2 AB")
+        );
+        assert_eq!(azure.get("SrcCountry").map(String::as_str), Some("Sweden"));
+    }
+
+    // Without -G the profile has no geo columns at all, so the enrichment above cannot be an
+    // artifact of columns that are always present.
+    #[test]
+    fn write_record_omits_geo_columns_without_geoip() {
+        use crate::core::log_source::LogSource;
+        let mut geo = None;
+        let azure = write_record_columns(
+            &LogSource::Azure,
+            r#"{"callerIpAddress": "89.160.20.112", "eventName": "E", "operationName": "op"}"#,
+            &mut geo,
+        );
+        assert_eq!(
+            azure.get("SrcIP").map(String::as_str),
+            Some("89.160.20.112")
+        );
+        for key in ["SrcASN", "SrcCity", "SrcCountry"] {
+            assert!(
+                !azure.contains_key(key),
+                "{key} must not be emitted without -G"
+            );
         }
     }
 

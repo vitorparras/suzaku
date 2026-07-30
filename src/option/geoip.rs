@@ -5,14 +5,18 @@ use std::path::Path;
 use std::str::FromStr;
 
 /// IPv6 ranges excluded from GeoIP lookup, as (network address, prefix length) pairs.
-/// Note that 2000::/3 (Global Unicast) covers effectively all public IPv6
-/// addresses: IPv6 is intentionally not geolocated and is reported as
-/// "Private"/"-" instead.
-/// FC00::/7 (Unique Local) already covers FD00::/8, but both are listed
-/// explicitly since they are commonly documented as separate ranges.
-const PRIVATE_IPV6_RANGES: [(u128, u32); 6] = [
+///
+/// Only ranges that genuinely cannot be geolocated belong here. 2000::/3 (Global Unicast) used to
+/// be listed, which suppressed every routable IPv6 address and reported it as "Private" — a claim
+/// that is not merely unhelpful but false, since those addresses are public and the shipped
+/// GeoLite2 databases resolve them (issue #182). It was removed; the remaining entries are
+/// unspecified, link-local, unique-local and multicast, none of which a GeoIP database can
+/// meaningfully answer for.
+///
+/// FC00::/7 (Unique Local) already covers FD00::/8, but both are listed explicitly since they are
+/// commonly documented as separate ranges.
+const PRIVATE_IPV6_RANGES: [(u128, u32); 5] = [
     (0x0000_0000_0000_0000_0000_0000_0000_0000, 128), // :: (Unspecified)
-    (0x2000_0000_0000_0000_0000_0000_0000_0000, 3),   // 2000::/3 (Global Unicast)
     (0xfe80_0000_0000_0000_0000_0000_0000_0000, 10),  // FE80::/10 (Link Local Unicast)
     (0xfc00_0000_0000_0000_0000_0000_0000_0000, 7),   // FC00::/7 (Unique Local)
     (0xfd00_0000_0000_0000_0000_0000_0000_0000, 8),   // FD00::/8 (Unique Local)
@@ -26,6 +30,23 @@ fn ipv6_in_range(ip: &Ipv6Addr, network: u128, prefix: u32) -> bool {
         u128::MAX << (128 - prefix)
     };
     (u128::from(*ip) & mask) == (network & mask)
+}
+
+/// Parses a log field into an IP address, unwrapping the IPv4-mapped IPv6 form
+/// (`::ffff:1.2.3.4`) that some sources write. Returns `None` for anything that is not an
+/// address — an empty string, a `-` placeholder, a `host:port` pair, or a service principal such
+/// as `cloudtrail.amazonaws.com`.
+///
+/// Free-standing rather than a `GeoIPSearch` method so the `SrcIP` column can pick the same
+/// candidate the GeoIP lookup will, whether or not `-G` was given. `GeoIPSearch::convert`
+/// delegates here, so the two can never drift apart.
+pub fn parse_ip(value: &str) -> Option<IpAddr> {
+    let value = if value.starts_with("::ffff:") {
+        value.replace("::ffff:", "")
+    } else {
+        value.to_string()
+    };
+    IpAddr::from_str(&value).ok()
 }
 
 pub fn is_private_ip(target_ip: &IpAddr) -> bool {
@@ -63,15 +84,7 @@ impl GeoIPSearch {
     }
 
     pub fn convert(&self, ip: &str) -> Option<IpAddr> {
-        let ip = if ip.starts_with("::ffff:") {
-            ip.replace("::ffff:", "")
-        } else {
-            ip.to_string()
-        };
-        if let Ok(ip) = IpAddr::from_str(&ip) {
-            return Some(ip);
-        }
-        None
+        parse_ip(ip)
     }
 
     pub fn get_asn(&mut self, ip: IpAddr) -> String {
@@ -183,24 +196,67 @@ mod tests {
         }
     }
 
+    /// #182: a routable IPv6 address must reach the databases, not be short-circuited as
+    /// "Private". `is_private_ip` alone would not catch a regression here -- the suppression can
+    /// come back either through the range list or through the callers' guards -- so this asserts
+    /// the values `GeoIPSearch` actually returns.
+    ///
+    /// The addresses are ones the checked-in GeoLite2 test fixtures resolve; each database covers
+    /// a different set, hence three of them. Verified by mutation: re-adding
+    /// `(0x2000_…, 3)` to `PRIVATE_IPV6_RANGES` fails every assertion below.
+    #[test]
+    fn ipv6_global_unicast_is_geolocated() {
+        use std::path::Path;
+
+        let mut geo = GeoIPSearch::new(Path::new("test_files/mmdb"))
+            .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/");
+
+        let jp = geo.convert("2001:218::1").expect("2001:218::1 must parse");
+        assert_eq!(geo.get_country(jp), "Japan");
+
+        let ch = geo
+            .convert("2001:1700::1")
+            .expect("2001:1700::1 must parse");
+        assert_eq!(geo.get_asn(ch), "Sunrise Communications AG");
+
+        // The address carried by the repo's own Azure fixture
+        // (test_files/json/azure_graph_api_format.json, claims.ipaddr).
+        let sonet = geo
+            .convert("240d:1a:7fe:a000:e4f5:37e6:6cfd:adbd")
+            .expect("the Azure fixture address must parse");
+        assert_eq!(geo.get_asn(sonet), "So-net Entertainment Corporation");
+
+        // Non-routable IPv6 keeps its placeholders -- removing 2000::/3 must not open the gate
+        // for addresses a GeoIP database genuinely cannot answer for.
+        let ula = geo
+            .convert("fd12:3456::1")
+            .expect("fd12:3456::1 must parse");
+        assert_eq!(geo.get_asn(ula), "Private");
+        assert_eq!(geo.get_country(ula), "-");
+        let loopback = geo.convert("::1").expect("::1 must parse");
+        assert_eq!(geo.get_asn(loopback), "Local");
+    }
+
     #[test]
     fn ipv6_private_ranges() {
-        for addr in [
-            "::",
-            "fe80::1",
-            "fc00::1",
-            "fd12:3456::1",
-            "ff02::1",
-            // Global unicast is excluded from GeoIP lookup by design.
-            "2001:4860:4860::8888",
-        ] {
+        for addr in ["::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1"] {
             assert!(
                 is_private_ip(&IpAddr::from_str(addr).unwrap()),
                 "{addr} should be private"
             );
         }
-        // Addresses outside every listed range must not match.
-        for addr in ["::1", "64:ff9b::1", "100::1"] {
+        // Addresses outside every listed range must not match. The global-unicast entries here
+        // are the point of #182: 2000::/3 was listed as private, so every routable IPv6 address
+        // -- Google Public DNS, a Japanese consumer ISP, an Azure sign-in from anywhere -- was
+        // reported as "Private" and never reached the database.
+        for addr in [
+            "::1",
+            "64:ff9b::1",
+            "100::1",
+            "2001:4860:4860::8888",
+            "2001:218::1",
+            "240d:1a:7fe:a000:e4f5:37e6:6cfd:adbd",
+        ] {
             assert!(
                 !is_private_ip(&IpAddr::from_str(addr).unwrap()),
                 "{addr} should not be private"
