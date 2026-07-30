@@ -741,27 +741,38 @@ fn get_value_from_event_common(
 ) -> String {
     // GeoIP処理部分（共通）: only the three geo columns are enriched. The source IP
     // is resolved from the profile's SrcIP field spec (`.sourceIPAddress` for AWS,
-    // `.callerIpAddress|.ClientIP|...` for Azure/M365) — NOT a hardcoded field name
-    // — so Azure/M365 enrich just like AWS. A missing GeoIP DB, a missing source IP,
-    // or a non-IP value (e.g. a service principal like "cloudtrail.amazonaws.com")
-    // yields the "-" placeholder for those columns only — it must never overwrite
-    // an unrelated column's value.
+    // `.claims.ipaddr|.callerIpAddress|.ClientIP|...` for Azure/M365) — NOT a hardcoded
+    // field name — so Azure/M365 enrich just like AWS. A missing GeoIP DB, no usable
+    // source IP, or a non-IP value (e.g. a service principal like
+    // "cloudtrail.amazonaws.com") yields the "-" placeholder for those columns only —
+    // it must never overwrite an unrelated column's value.
+    //
+    // The spec is a fallback list, so the search takes the first candidate that PARSES
+    // as an IP, not merely the first that exists. Stopping at the first present key
+    // meant an earlier candidate holding "", "-", a host:port pair or any other non-IP
+    // ended the lookup, and a valid address in a later field was never consulted — the
+    // geo columns then rendered "-" for a record that plainly carried a routable IP
+    // (issue #183). Azure records commonly have `claims.ipaddr` absent-or-empty while
+    // `callerIpAddress` is populated, so this was reachable on ordinary input.
+    //
+    // Note this can select a different field than the `SrcIP` column displays: that
+    // column goes through the generic `.a|.b` resolver below, which still shows the
+    // first PRESENT value. They only diverge when an earlier candidate is present but
+    // unusable, and each stays individually truthful — SrcIP reports what the log
+    // recorded, the geo columns describe the address they actually resolved.
     if matches!(key, "SrcASN" | "SrcCity" | "SrcCountry") {
         if let Some(geo) = geo_ip {
-            let ip_value = src_ip
+            let resolved = src_ip
                 .split('|')
                 .map(|k| k.trim_matches('.').trim())
                 .filter(|k| !k.is_empty())
-                .find_map(|k| event.get(k));
-            if let Some(ip) = ip_value {
-                let ip = ip.value_to_string();
-                if let Some(ip) = geo.convert(ip.as_str()) {
-                    return match key {
-                        "SrcASN" => geo.get_asn(ip),
-                        "SrcCity" => geo.get_city(ip),
-                        _ => geo.get_country(ip),
-                    };
-                }
+                .find_map(|k| geo.convert(event.get(k)?.value_to_string().as_str()));
+            if let Some(ip) = resolved {
+                return match key {
+                    "SrcASN" => geo.get_asn(ip),
+                    "SrcCity" => geo.get_city(ip),
+                    _ => geo.get_country(ip),
+                };
             }
         }
         return "-".to_string();
@@ -1349,6 +1360,70 @@ mod tests {
                 false,
                 ".sourceIPAddress"
             ),
+            "-"
+        );
+    }
+
+    // #183: the SrcIP spec is a fallback list, so an earlier candidate that exists but holds
+    // nothing usable must not end the search. Before the fix `find_map(event.get)` committed to
+    // the first PRESENT key and parsing happened afterwards, so each case below rendered "-"
+    // even though a routable address sat in the next field.
+    #[test]
+    fn geoip_skips_unusable_candidates_and_takes_the_first_parseable_one() {
+        use crate::option::geoip::GeoIPSearch;
+        use sigma_rust::{event_from_json, rule_from_yaml};
+        use std::path::Path;
+
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
+        )
+        .unwrap();
+        let mut geo = Some(
+            GeoIPSearch::new(Path::new("test_files/mmdb"))
+                .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
+        );
+        let spec = ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress";
+
+        // Every shape an earlier candidate can take while a later one holds a real address.
+        // "89.160.20.112:443" is the M365 UAL `ClientIP` host:port form, the likeliest trigger.
+        for first in [
+            "\"\"",
+            "\"-\"",
+            "\"not-an-ip\"",
+            "\"89.160.20.112:443\"",
+            "null",
+        ] {
+            let event = event_from_json(&format!(
+                r#"{{"claims": {{"ipaddr": {first}}}, "callerIpAddress": "89.160.20.112", "eventName": "E"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                get_value_from_event("SrcCountry", &event, Some(&rule), &mut geo, false, spec),
+                "Sweden",
+                "an unusable first candidate ({first}) must not end the search"
+            );
+        }
+
+        // A usable earlier candidate still wins -- the search takes the FIRST parseable value,
+        // it does not simply prefer whichever field resolves in the database.
+        let both = event_from_json(
+            r#"{"claims": {"ipaddr": "81.2.69.144"}, "callerIpAddress": "89.160.20.112", "eventName": "E"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_value_from_event("SrcCity", &both, Some(&rule), &mut geo, false, spec),
+            "London",
+            "the first parseable candidate must win, not a later one"
+        );
+
+        // Nothing usable anywhere still yields the placeholder rather than enriching from an
+        // unrelated field.
+        let none = event_from_json(
+            r#"{"claims": {"ipaddr": "not-an-ip"}, "callerIpAddress": "also-not-an-ip", "eventName": "E"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_value_from_event("SrcCountry", &none, Some(&rule), &mut geo, false, spec),
             "-"
         );
     }
