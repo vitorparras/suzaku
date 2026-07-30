@@ -1376,6 +1376,14 @@ mod tests {
     // spec, so an Azure `callerIpAddress` enriches identically to an AWS
     // `sourceIPAddress`. Before the fix the Azure field was ignored (the lookup
     // hardcoded `sourceIPAddress`) and the geo columns were always "-".
+    //
+    // The IP must be one the checked-in GeoLite2 *test* databases actually contain --
+    // they are MaxMind's small fixtures, not the real feeds, and resolve only a handful
+    // of ranges. 89.160.20.112 is in all three (ASN "Bredband2 AB", city Linköping,
+    // country Sweden). An IP outside them, such as a public resolver address, makes
+    // every branch return "-" and the assertions stop distinguishing the fix from the
+    // bug: verified by mutation that with the hardcoded `event.get("sourceIPAddress")`
+    // restored, this test fails on the Azure lookups below and passed before this change.
     #[test]
     fn geoip_resolves_source_ip_via_profile_spec() {
         use crate::option::geoip::GeoIPSearch;
@@ -1386,7 +1394,8 @@ mod tests {
             "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\n",
         )
         .unwrap();
-        let ip = "8.8.8.8";
+        // Present in test_files/mmdb for all three databases.
+        let ip = "89.160.20.112";
         let aws_event = event_from_json(&format!(
             r#"{{"sourceIPAddress": "{ip}", "eventName": "E"}}"#
         ))
@@ -1400,28 +1409,50 @@ mod tests {
             GeoIPSearch::new(Path::new("test_files/mmdb"))
                 .expect("GeoLite2 test .mmdb files must be present under test_files/mmdb/"),
         );
-        let aws_country = get_value_from_event(
-            "SrcCountry",
-            &aws_event,
-            Some(&rule),
-            &mut geo,
-            false,
-            ".sourceIPAddress",
+        let lookup = |key: &str, event: &sigma_rust::Event, spec: &str, geo: &mut _| {
+            get_value_from_event(key, event, Some(&rule), geo, false, spec)
+        };
+
+        // The AWS field enriches -- this is the control. If these ever go back to "-" the
+        // test databases have changed and the assertions below would stop meaning anything.
+        assert_eq!(
+            lookup("SrcCountry", &aws_event, ".sourceIPAddress", &mut geo),
+            "Sweden",
+            "the control lookup must enrich; is 89.160.20.112 still in test_files/mmdb?"
         );
-        let azure_country = get_value_from_event(
-            "SrcCountry",
-            &azure_event,
-            Some(&rule),
-            &mut geo,
-            false,
-            ".callerIpAddress",
+
+        // The Azure field must enrich identically, resolved through the profile's spec
+        // rather than a hardcoded AWS field name. Each of the three geo columns is checked
+        // because they are three separate lookups against three separate databases.
+        assert_eq!(
+            lookup("SrcCountry", &azure_event, ".callerIpAddress", &mut geo),
+            "Sweden"
         );
-        // Same IP + same DB must enrich identically regardless of the field name.
-        assert_eq!(aws_country, azure_country);
-        // When the DB actually resolves the IP, the Azure field must enrich (not "-").
-        if aws_country != "-" {
-            assert_ne!(azure_country, "-");
-        }
+        assert_eq!(
+            lookup("SrcASN", &azure_event, ".callerIpAddress", &mut geo),
+            "Bredband2 AB"
+        );
+        assert_eq!(
+            lookup("SrcCity", &azure_event, ".callerIpAddress", &mut geo),
+            "Linköping"
+        );
+
+        // The real Azure/M365 profile declares a `|`-separated fallback list; the field
+        // that is actually present must be found wherever it sits in that list.
+        let azure_spec = ".claims.ipaddr|.callerIpAddress|.ClientIP|.ActorIpAddress";
+        assert_eq!(
+            lookup("SrcCountry", &azure_event, azure_spec, &mut geo),
+            "Sweden",
+            "a later candidate in the SrcIP spec must still be found"
+        );
+
+        // A profile with no SrcIP column, or an event carrying none of the candidates,
+        // yields the placeholder rather than enriching from some unrelated field.
+        assert_eq!(lookup("SrcCountry", &azure_event, "", &mut geo), "-");
+        assert_eq!(
+            lookup("SrcCountry", &aws_event, ".callerIpAddress", &mut geo),
+            "-"
+        );
     }
 
     /// The full AWS timeline profile, so the schema assertions below run against the real
