@@ -1,6 +1,6 @@
 # Changes
 
-## 2.0.0 [xxxx/xx/xx]
+## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
 **New Features:**
 
