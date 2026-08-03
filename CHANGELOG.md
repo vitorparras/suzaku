@@ -1,6 +1,6 @@
 # Changes
 
-## 2.0.0 [xxxx/xx/xx]
+## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
 **New Features:**
 
@@ -11,6 +11,7 @@
 
 **Enhancements:**
 
+- Replaced the wildcard (`"*"`) version requirements on ten dependencies with explicit floors, so a future breaking release is a deliberate bump rather than something a `cargo update` accepts silently. Six of them are pre-1.0, where every minor is a breaking change under Cargo's semver rules. This is the failure mode behind #131, where a wildcard-pinned `cidr-utils` shipped a backend that stopped accepting abbreviated CIDR and `--geo-ip` began panicking at startup with nothing in Suzaku having changed. No resolved version changes: `cargo update` produces an identical `Cargo.lock` with and without the floors. (#189) (@YamatoSecurity)
 - Errors that end the run are now all printed in red and all honor `--no-color`. Previously the color was inconsistent: some (a nonexistent input path, an invalid `-m, --min-level`, a missing rules folder or output profile, an existing output file without `-C`, a failed `update-rules`) were printed in the default terminal color, and a few others were hard-coded red that ignored `--no-color`. They now share a single `error_msg()` helper with `fatal_error()`. (@fukusuket)
 - Warnings and errors raised while processing logs (skipped files, a failed directory scan, correlation-event errors, a missing abused-AWS-API list) are now written to `logs/errorlog-<YYYYMMDD_HHMMSS>.log` instead of the terminal, so they no longer interleave with the progress bar or bury the results summary. The file is created only when there is something to report, its first line is the command line that produced it, and the run ends with a single `Warnings and errors: <n> messages saved to <path>` pointer. Fatal errors that abort the run are still printed to the terminal as well. (@fukusuket)
 - Reworked `-t, --output-type` for `aws-ct-summary` to take format **names** like the timeline commands, and added **DuckDB** output. Pass `csv`, `json`, `jsonl`, and/or `duckdb` (comma-separated or repeated), e.g. `-t csv,duckdb`. Because the CSV folds each principal's API calls and attributes into multi-line cells that cannot be queried, the DuckDB output stores them **relationally** across three tables — `summary` (one row per principal), `summary_api_calls` (one row per principal/API, labelled `abused_success`/`abused_failed`/`other_success`/`other_failed`) and `summary_attributes` (one row per principal/value, labelled `aws_region`/`src_ip`/`access_key_id`/`user_agent`) — so questions the CSV cannot answer, such as which source IPs were used by the principals that called an abused API, become ordinary joins. (Breaking: the numeric `-t 1..5` form is replaced by names, matching the other commands.) (@YamatoSecurity)

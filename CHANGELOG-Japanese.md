@@ -1,6 +1,6 @@
 # 変更点
 
-## 2.0.0 [xxxx/xx/xx]
+## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
 **新機能:**
 
@@ -11,6 +11,7 @@
 
 **改善:**
 
+- 10個の依存クレートのバージョン指定をワイルドカード（`"*"`）から明示的な下限付きに変更した。これにより、将来の破壊的変更を含むリリースが`cargo update`で自動的に取り込まれることがなくなり、意図的なバージョン更新が必要になる。うち6個は1.0未満のクレートであり、Cargoのセマンティックバージョニングではマイナーバージョンの更新がすべて破壊的変更として扱われる。これは#131で実際に発生した問題であり、ワイルドカード指定の`cidr-utils`が省略形のCIDR表記を受け付けないバックエンドに更新された結果、Suzaku側は何も変更していないにもかかわらず`--geo-ip`が起動時にパニックしていた。解決されるバージョンは変わらない（下限指定の有無にかかわらず`cargo update`は同一の`Cargo.lock`を生成する）。 (#189) (@YamatoSecurity)
 - 実行を終了するエラーの表示色をすべて赤に統一し、`--no-color` にも対応させた。従来は色が統一されておらず、一部（存在しない入力パス、不正な `-m, --min-level`、ルールフォルダや出力プロファイルの未検出、`-C` なしでの出力ファイル上書き、`update-rules` の失敗）はターミナルの既定色で表示され、逆に一部は `--no-color` を無視する赤色のハードコードになっていた。これらを `fatal_error()` と共通の `error_msg()` ヘルパーに集約した。 (@fukusuket)
 - ログ処理中に発生した警告・エラー（読み込めずスキップしたファイル、ディレクトリスキャンの失敗、相関イベント処理のエラー、悪用AWS APIリストの読み込み失敗など）を、ターミナルではなく `logs/errorlog-<YYYYMMDD_HHMMSS>.log` に出力するようにした。これによりプログレスバーの表示が崩れたり、結果サマリーがメッセージで埋もれたりしなくなる。ファイルは出力すべきメッセージがある場合のみ作成され、先頭行には実行したコマンドラインを出力する。実行の最後に `Warnings and errors: <件数> messages saved to <パス>` の1行のみを表示する。実行を中断する致命的なエラーは従来どおりターミナルにも表示する。 (@fukusuket)
 - `aws-ct-summary` の `-t, --output-type` をタイムライン系コマンドと同様に形式**名**で指定する方式に変更し、**DuckDB** 出力を追加した。`csv`・`json`・`jsonl`・`duckdb` をカンマ区切り（または繰り返し）で指定できる（例: `-t csv,duckdb`）。CSV では各プリンシパルの API 呼び出しや属性が複数行のセルにまとめられており SQL で扱えないため、DuckDB 出力では**リレーショナル**な3テーブル構成にした。`summary`（プリンシパルごとに1行）、`summary_api_calls`（プリンシパルと API ごとに1行、`abused_success`/`abused_failed`/`other_success`/`other_failed` のラベル付き）、`summary_attributes`（プリンシパルと値ごとに1行、`aws_region`/`src_ip`/`access_key_id`/`user_agent` のラベル付き）である。これにより、悪用された API を呼び出したプリンシパルがどの送信元 IP を使っていたかといった、CSV では答えられない問いが通常の JOIN で解けるようになる。（破壊的変更: 数字 `-t 1..5` は他コマンドと同様に名前指定へ置き換えられた。） (@YamatoSecurity)
@@ -21,6 +22,10 @@
 - `azure-timeline` が SigmaHQ の Microsoft 365 ルールを読み込み・マッチできるようにした。これらのルールは `logsource.service` を `audit`/`exchange`/`threat_detection`/`threat_management` として宣言しているが、従来は `m365` しか認識されず、アップストリームの m365 ルールがすべて読み込み時に破棄されていた。これらのサービスを `m365` と同じ Unified Audit Log の判別（`Workload`/`RecordType`）で振り分けるようにした。 (#137) (@YamatoSecurity)
 - 異なるログソースの取り扱いを容易にするため、コードをリファクタリングした。 (@fukusuket)
 - Microsoft Graph API JSON形式のAzureログに対応した。 (#113) (@fukusuket)
+- `azure-timeline`が、Azure Monitorの診断設定BLOBやEvent Hubメッセージで使われる`{ "records": [...] }`形式のバッチエンベロープを展開するようにした（ファイル全体・行単位の両方に対応）。これにより、これらのエクスポートが単一のイベントではなくレコード単位で読み込まれるようになった。また、従来は読み込み時に破棄されていた`identity_protection`（`riskdetection`）および`privileged_identity_management`（`pim`）のルール種別も読み込み・マッチできるようにした。 (#130) (@YamatoSecurity)
+
+- `azure-timeline`をMicrosoft 365統合監査ログ（Unified Audit Log）に対応させた。`AuditData`列・ラッパーを展開することで`Search-UnifiedAuditLog`のCSVエクスポート（およびJSON）を読み込み、UALのName/Value形式のプロパティバッグ（`ExtendedProperties`/`Parameters`など）をオブジェクトに変換してルールがネストされた値（例: `ExtendedProperties.UserAgent`）にマッチできるようにし、単一・整形済みのレコードオブジェクトも解析できるようにした。あわせて、時刻フィルタが未指定の場合にイベントが破棄されないよう修正し、`CreationTime`のタイムスタンプを解析できるようにし、ログソースのサービスとして`m365`を追加した。Azureの出力プロファイルも、従来のAzure Monitor専用の空欄になっていたカラムに代わり、DFIRで有用なM365のフィールド（`Workload`、`Operation`、`Result`、`User`、`SrcIP`、`TargetObject`、`UserAgent`、`AppId`、`LogonError`、および変更内容の`Parameters`/`ModifiedProperties`をまとめた`Details`）を出力するようにした。 (#129) (@YamatoSecurity)
+
 - 既存の `--timeline-start/--timeline-end` オプション（ファイル内のイベントタイムスタンプに基づいて動作する）とは異なり、S3キーの日付プレフィックスに基づいてオブジェクトをフィルタリングする `--file-date-from/--file-date-to` オプションを追加した。 (#118) (@fukusuket)
 - `aws-ct-summary`コマンドに、JSON形式で出力するための`-output-type`オプションを追加した。 (#123) (@fukusuket)
 - `aws-ct-metrics`で複数フィールドを1回のスキャンでまとめて集計し、結果を拡充できるようにした。`-F, --field-name`はカンマ区切りのリストを受け付け（例: `-F sourceIPAddress,userAgent,userIdentity.arn,awsRegion,userIdentity.accessKeyId`）、フィールドごとにフルスキャンを繰り返すのではなく、1回のスキャンですべてのフィールドを集計する。各値について、その値の`FirstSeen`/`LastSeen`も出力するようにした。`-G, --geo-ip`を指定すると、IPアドレスとして解釈できる値に`SrcASN`/`SrcCity`/`SrcCountry`列が追加される。`-t, --output-type`でcsv/json/jsonl/duckdbを出力できる（DuckDB出力はそのままクエリできる単一の`metrics`テーブル）。`-s, --include-sts-keys`は`aws-ct-summary`と同様で、一時的な`ASIA...`のSTSキーは指定しない限り除外する。また、指定したフィールドを持たないイベントは破棄せず`-`として集計するようにしたため、割合はスキャンした全イベントに対する比率になる。さらに`-F`はスキャン開始前にCloudTrailのレコードフィールドと照合して検証するようにした。大文字小文字を誤った名前は、データセット全体をスキャンして全イベントを`-`として報告する代わりに、`'sourceIPaddress' is not a CloudTrail field. Did you mean 'sourceIPAddress'?`として即座に失敗する。APIごとに内容が異なるコンテナ（`requestParameters`・`responseElements`・`additionalEventData`など）配下の任意のパスは従来どおりそのまま指定できる。（破壊的変更: CSVの列が`EventName,Percent,Total`から`Field,Value,Count,Percent,FirstSeen,LastSeen`に変更された。） (@fukusuket)
@@ -45,6 +50,8 @@
 - `-T, --no-frequency-timeline`オプションが機能していなかったため削除した。また、作者表示のロジックバグを修正した。 (#110) (@fukusuket)
 - 結果がなくても出力ファイルは保存されていた。 (#114) (@fukusuket)
 - `aws-ct-summary`は、破損または不完全なログファイルを処理する際にパニックを起こしていた。 (#119) (@fukusuket)
+
+- `--geo-ip`が起動時に`invalid IP address syntax`でパニックを起こしていた。プライベートIP判定に使っていた省略形のCIDR文字列（`10/8`、`172.16/12`、`2000::/3`など）が`cidr`クレートで受け付けられなくなったことが原因である。`cidr-utils`への依存をやめ、IPv4は標準ライブラリの`Ipv4Addr::is_private()`で、IPv6は手動のプレフィックス判定でプライベート範囲を確認するようにした。あわせて、それまで使われていなかったGeoIPの国・都市キャッシュを利用するようにした。 (#132) (@fukusuket)
 
 ## 1.1.0 [2025/08/14] - Obon Release
 
