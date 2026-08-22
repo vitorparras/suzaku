@@ -37,7 +37,23 @@ fn format_timestamp(value: &str, localtime: bool) -> String {
     if !localtime {
         return value.replace("T", " ").replace("Z", "");
     }
-    let utc: Option<DateTime<Utc>> = DateTime::parse_from_rfc3339(value)
+    match parse_event_time(value) {
+        Some(u) => u
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S%:z")
+            .to_string(),
+        None => value.replace("T", " ").replace("Z", ""),
+    }
+}
+
+/// Parses an event timestamp into a UTC instant.
+///
+/// Accepts RFC 3339 (`2023-07-10T12:27:45Z`, `2023-07-10T21:27:45+09:00`) and a naive datetime,
+/// which is assumed to be UTC. This is the same ladder [`format_timestamp`] renders with, so the
+/// instant a timestamp is *displayed* as and the instant it is *analysed* as can never disagree.
+/// Anything else yields `None`; a caller decides whether to skip the value or place it last.
+fn parse_event_time(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
         .or_else(|| {
@@ -45,14 +61,34 @@ fn format_timestamp(value: &str, localtime: bool) -> String {
                 .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
                 .ok()
                 .map(|ndt| Utc.from_utc_datetime(&ndt))
-        });
-    match utc {
-        Some(u) => u
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M:%S%:z")
-            .to_string(),
-        None => value.replace("T", " ").replace("Z", ""),
-    }
+        })
+}
+
+/// Resolves an output-profile field spec against an event, returning the bare key that matched
+/// and its value.
+///
+/// A spec is dot-prefixed and may be a `|`-separated fallback list: `.eventTime` for AWS,
+/// `.time|.eventTimestamp|.CreationTime` for Azure/M365. [`Event::get`] takes a *bare* field name
+/// and reads `.` as a nesting separator, so handing it a spec verbatim resolves nothing at all —
+/// `event.get(".eventTime")` looks for an empty-named parent map and returns `None` for every
+/// event on earth. Every caller that needs a profile-named field must go through here.
+///
+/// The first candidate PRESENT wins, which is exactly how the column itself is rendered, so a
+/// caller always sees the same field the output shows. The matched key is returned because the
+/// caller may need it to decide what kind of value it has (see [`get_value_from_event_common`]).
+fn resolve_field_spec<'a>(spec: &'a str, event: &Event) -> Option<(&'a str, String)> {
+    spec.split('|')
+        .map(|k| k.trim_matches('.').trim())
+        .filter(|k| !k.is_empty())
+        .find_map(|k| event.get(k).map(|v| (k, v.value_to_string())))
+}
+
+/// The event's timestamp as a UTC instant, resolved through the profile's `Timestamp` field spec.
+///
+/// `None` when the field is absent or unparseable — the caller decides what that means, and no
+/// caller may assume it cannot happen: cloud logs carry malformed timestamps.
+pub fn event_timestamp(spec: &str, event: &Event) -> Option<DateTime<Utc>> {
+    resolve_field_spec(spec, event).and_then(|(_, value)| parse_event_time(&value))
 }
 
 pub struct Writers {
@@ -814,23 +850,20 @@ fn get_value_from_event_common(
     }
     // イベントフィールド処理（共通）
     if key.starts_with(".") {
-        let key_without_prefix = key.trim_start_matches('.').trim();
-        let keys: Vec<&str> = key_without_prefix.split('|').collect();
-        for k in keys {
-            let k_trimmed = k.trim_matches('.').trim();
-            if let Some(value) = event.get(k_trimmed) {
-                return if k_trimmed.contains("eventTime")
-                    || k_trimmed.contains("time")
-                    || k_trimmed.contains("eventTimestamp")
-                    || k_trimmed.contains("CreationTime")
+        match resolve_field_spec(key, event) {
+            Some((matched, value)) => {
+                if matched.contains("eventTime")
+                    || matched.contains("time")
+                    || matched.contains("eventTimestamp")
+                    || matched.contains("CreationTime")
                 {
-                    format_timestamp(&value.value_to_string(), localtime)
+                    format_timestamp(&value, localtime)
                 } else {
-                    value.value_to_string()
-                };
+                    value
+                }
             }
+            None => "-".to_string(),
         }
-        "-".to_string()
     } else if key.starts_with("sigma.") {
         let key = key.replace("sigma.", "");
         match key.as_str() {
@@ -1233,6 +1266,78 @@ mod tests {
     fn format_timestamp_localtime_falls_back_on_unparseable() {
         // Non-timestamp values must not be dropped; fall back to the UTC rendering.
         assert_eq!(format_timestamp("not-a-timestamp", true), "not-a-timestamp");
+    }
+
+    // `Event::get` takes a bare field name and reads `.` as a nesting separator, so every
+    // profile spec -- all of which are dot-prefixed, and half of which are `|`-separated
+    // fallback lists -- resolves to `None` when handed to it verbatim. That is not a
+    // hypothetical: `append_summary_data`, `process_correlation_base_rule` and the correlation
+    // date histogram all did exactly that, which left the summary's date breakdown empty and
+    // stopped every correlation rule from ever firing. Verified by mutation: replacing the
+    // body of `resolve_field_spec` with `event.get(spec)` fails both tests below.
+    #[test]
+    fn resolve_field_spec_reads_dot_prefixed_and_fallback_specs() {
+        use sigma_rust::event_from_json;
+
+        let aws = event_from_json(r#"{"eventTime": "2023-07-10T12:27:45Z"}"#).unwrap();
+        assert_eq!(
+            resolve_field_spec(".eventTime", &aws),
+            Some(("eventTime", "2023-07-10T12:27:45Z".to_string())),
+            "the AWS profile's own Timestamp spec must resolve"
+        );
+
+        // Azure/M365 name the field three different ways; the first one PRESENT wins, which is
+        // how the Timestamp column itself is rendered.
+        let azure = event_from_json(r#"{"CreationTime": "2023-07-10T12:27:45"}"#).unwrap();
+        assert_eq!(
+            resolve_field_spec(".time|.eventTimestamp|.CreationTime", &azure),
+            Some(("CreationTime", "2023-07-10T12:27:45".to_string()))
+        );
+        let graph = event_from_json(r#"{"time": "a", "CreationTime": "b"}"#).unwrap();
+        assert_eq!(
+            resolve_field_spec(".time|.eventTimestamp|.CreationTime", &graph),
+            Some(("time", "a".to_string())),
+            "an earlier candidate that is present must win"
+        );
+
+        // Nested keys keep their inner dots; only the spec's own delimiters are stripped.
+        let nested = event_from_json(r#"{"userIdentity": {"userName": "root"}}"#).unwrap();
+        assert_eq!(
+            resolve_field_spec(".userIdentity.userName", &nested),
+            Some(("userIdentity.userName", "root".to_string()))
+        );
+
+        assert_eq!(resolve_field_spec(".missing", &aws), None);
+        assert_eq!(resolve_field_spec("", &aws), None);
+    }
+
+    #[test]
+    fn event_timestamp_resolves_profile_specs_to_utc_instants() {
+        use sigma_rust::event_from_json;
+
+        let expected = Utc.with_ymd_and_hms(2023, 7, 10, 12, 27, 45).unwrap();
+
+        let aws = event_from_json(r#"{"eventTime": "2023-07-10T12:27:45Z"}"#).unwrap();
+        assert_eq!(event_timestamp(".eventTime", &aws), Some(expected));
+
+        // An explicit offset is an instant, not a wall clock.
+        let offset = event_from_json(r#"{"time": "2023-07-10T21:27:45+09:00"}"#).unwrap();
+        assert_eq!(
+            event_timestamp(".time|.eventTimestamp|.CreationTime", &offset),
+            Some(expected)
+        );
+
+        // Naive values (M365 CreationTime) are UTC, matching how they are displayed.
+        let naive = event_from_json(r#"{"CreationTime": "2023-07-10T12:27:45"}"#).unwrap();
+        assert_eq!(
+            event_timestamp(".time|.eventTimestamp|.CreationTime", &naive),
+            Some(expected)
+        );
+
+        // Garbage and absence are both `None`, never a panic and never a bogus instant.
+        let garbage = event_from_json(r#"{"eventTime": "yesterday"}"#).unwrap();
+        assert_eq!(event_timestamp(".eventTime", &garbage), None);
+        assert_eq!(event_timestamp(".eventTime", &naive), None);
     }
 
     #[test]

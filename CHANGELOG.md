@@ -1,5 +1,11 @@
 # Changes
 
+## 2.0.1 [Unreleased]
+
+**Bug Fixes:**
+
+- The summary's `Dates with most total detections` line printed `n/a` for every level, `first_event_time`/`last_event_time` were never set, and **Sigma correlation rules never fired at all**, because the event's timestamp was looked up with the output profile's field spec passed to `Event::get` verbatim. Those specs are dot-prefixed and may be `|`-separated fallback lists (`.eventTime` for AWS, `.time|.eventTimestamp|.CreationTime` for Azure/M365), while `Event::get` takes a *bare* field name and reads `.` as a nesting separator — so `event.get(".eventTime")` looked for an empty-named parent map and returned `None` for every event ever scanned. Three call sites were affected: the per-detection date/first/last-event bookkeeping, the correlation engine's base-rule matching (a base-rule hit with no timestamp cannot enter a correlation window, so no correlation ever completed and all five shipped correlation rules were dead — four failed console logins from one IP within five minutes produced zero `Many Failed Logins` detections), and the correlation date histogram. All three now resolve the field through one shared helper that applies the same "first candidate present wins" rule the `Timestamp` column itself is rendered with, so what is displayed and what is analysed can no longer disagree. Timestamps are parsed as RFC 3339 or as a naive datetime assumed to be UTC, matching `-l, --localtime` rendering. (@fukusuket)
+
 ## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
 **New Features:**

@@ -6,12 +6,12 @@ use crate::core::rules;
 use crate::core::scan::{append_summary_data, scan_directory, scan_file};
 use crate::core::summary::{DetectionSummary, print_detected_rule_authors, print_summary};
 use crate::core::timeline_writer::{
-    OutputConfig, OutputContext, init_writers, write_correlation_record, write_record,
+    OutputConfig, OutputContext, event_timestamp, init_writers, write_correlation_record,
+    write_record,
 };
 use crate::core::util::{fatal_error, load_profile, output_path_info, p};
 use crate::option::cli::{CommonOptions, TimelineOptions};
 use crate::option::geoip::GeoIPSearch;
-use chrono::{DateTime, Utc};
 use num_format::{Locale, ToFormattedString};
 use serde_json::Value;
 use sigma_rust::{CorrelationEngine, Rule, TimestampedEvent, parse_rules_from_yaml};
@@ -247,18 +247,15 @@ fn process_correlation_events(
                             .and_modify(|e| *e += 1)
                             .or_insert(1);
                         let event = &res.events.last().unwrap().event;
-                        if let Some(event_time) = event.get(context.prof_ts_key) {
-                            let event_time_str = event_time.value_to_string();
-                            if let Ok(event_time) = event_time_str.parse::<DateTime<Utc>>() {
-                                let date = event_time.date_naive().format("%Y-%m-%d").to_string();
-                                summary
-                                    .dates_with_hits
-                                    .entry(level)
-                                    .or_default()
-                                    .entry(date)
-                                    .and_modify(|e| *e += 1)
-                                    .or_insert(1);
-                            }
+                        if let Some(event_time) = event_timestamp(context.prof_ts_key, event) {
+                            let date = event_time.date_naive().format("%Y-%m-%d").to_string();
+                            summary
+                                .dates_with_hits
+                                .entry(level)
+                                .or_default()
+                                .entry(date)
+                                .and_modify(|e| *e += 1)
+                                .or_insert(1);
                         }
                     }
                 }
