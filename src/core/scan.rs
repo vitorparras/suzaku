@@ -495,11 +495,26 @@ fn detect_events<'a>(
             })
             .collect();
 
+        // process correlation base rules
+        // Kept aligned with `json_events` (one entry per event) so the hit statistics below can
+        // tell whether an event matched a base rule; flattened into `matched_correlation` after.
+        let base_rule_matched: Vec<Vec<TimestampedEvent>> =
+            process_correlation_base_rule(engine, &json_events, context);
+
         // perform post-processing
         // calculate some statistics values
+        // An event counts once, here in the scan pass, which is the only place every event is
+        // visited exactly once. It is "with hits" if any detection rule or any correlation base
+        // rule matched it. The correlation pass used to add to this counter as well, once per
+        // event per firing correlation result, so an event in several results (or already
+        // counted here) was counted several times and `event_with_hits` could exceed
+        // `total_events`, which pinned the reported data reduction at 0 events (0.00%).
         summary.event_with_hits += results
             .iter()
-            .filter(|(_, _, matched_rules)| !matched_rules.is_empty())
+            .zip(base_rule_matched.iter())
+            .filter(|((_, _, matched_rules), base_matched)| {
+                !matched_rules.is_empty() || !base_matched.is_empty()
+            })
             .count();
         summary.total_events += json_events.len();
 
@@ -512,21 +527,21 @@ fn detect_events<'a>(
             }
         }
 
-        // process correlation base rules
-        let base_rule_matched: Vec<TimestampedEvent> =
-            process_correlation_base_rule(engine, json_events, context);
-        matched_correlation.extend(base_rule_matched);
+        matched_correlation.extend(base_rule_matched.into_iter().flatten());
     }
 }
 
+/// Match every event against the correlation base rules, returning one `Vec` per event (in the
+/// order of `json_events`) holding the events it produced — empty when no base rule matched.
+/// The per-event grouping is what lets the caller count an event as "with hits" exactly once.
 fn process_correlation_base_rule<'a>(
     engine: &'a CorrelationEngine,
-    json_events: Vec<(&Value, Event)>,
+    json_events: &[(&Value, Event)],
     context: &mut OutputContext,
-) -> Vec<TimestampedEvent<'a>> {
+) -> Vec<Vec<TimestampedEvent<'a>>> {
     json_events
         .par_iter()
-        .flat_map(|(_, event)| {
+        .map(|(_, event)| {
             engine
                 .base_rules
                 .values()

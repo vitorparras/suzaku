@@ -226,7 +226,10 @@ fn process_correlation_events(
                         if generate {
                             write_record(&event.event, &Value::Null, Some(event.rule), context);
                         }
-                        summary.event_with_hits += 1;
+                        // `event_with_hits` is not touched here: these events were already
+                        // counted once in the scan pass (they matched a base rule there), and a
+                        // single event reaches this loop once per firing correlation result it
+                        // belongs to, so incrementing here double-counted it.
                         append_summary_data(summary, &event.event, event.rule, generate, context);
                     }
                     write_correlation_record(&res.events, rule, context);

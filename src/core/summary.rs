@@ -45,21 +45,27 @@ pub fn print_summary(sum: &DetectionSummary, no_color: bool) {
     print_summary_table(sum, &levels);
 }
 
-/// Compute the "data reduction" count and percentage for the summary header.
+/// `count` as a percentage of `total`, in floating point so fractions of a percent survive.
 ///
-/// `event_with_hits` can exceed `total_events` when correlation results re-count
-/// events already tallied by the base scan, so the subtraction is saturating and
-/// the percentage is guarded against an empty dataset (0/0) — otherwise the
-/// header panics on subtract-overflow in debug builds, wraps to ~1.8e19 in
-/// release, or prints `NaN%` on empty input.
-fn data_reduction(total_events: usize, event_with_hits: usize) -> (usize, f64) {
-    let reduction = total_events.saturating_sub(event_with_hits);
-    let pct = if total_events == 0 {
+/// Integer division (`count * 100 / total`) truncated every share below 1% to `0`, and because
+/// `Display` for integers ignores the precision option, `{:.2}` printed that as `0` rather than
+/// `0.00`. Guarded against an empty denominator so the summary never prints `NaN%`.
+fn percentage(count: usize, total: usize) -> f64 {
+    if total == 0 {
         0.0
     } else {
-        reduction as f64 * 100.0 / total_events as f64
-    };
-    (reduction, pct)
+        count as f64 * 100.0 / total as f64
+    }
+}
+
+/// Compute the "data reduction" count and percentage for the summary header.
+///
+/// The subtraction is saturating as a last line of defence: `event_with_hits` is counted once
+/// per source event during the scan pass, so it should never exceed `total_events`, but an
+/// underflow here panics in debug builds and wraps to ~1.8e19 in release.
+fn data_reduction(total_events: usize, event_with_hits: usize) -> (usize, f64) {
+    let reduction = total_events.saturating_sub(event_with_hits);
+    (reduction, percentage(reduction, total_events))
 }
 
 fn print_summary_header(sum: &DetectionSummary, no_color: bool) {
@@ -88,7 +94,20 @@ fn print_summary_header(sum: &DetectionSummary, no_color: bool) {
     println!();
 }
 
+/// Totals used as the denominators of the per-level percentages: every detection, and every
+/// unique rule that fired.
+fn detection_totals(sum: &DetectionSummary) -> (usize, usize) {
+    let total: usize = sum.level_with_hits.values().flat_map(|h| h.values()).sum();
+    let uniq: usize = sum.level_with_hits.values().map(|h| h.len()).sum();
+    (total, uniq)
+}
+
 fn print_summary_levels(sum: &DetectionSummary, levels: &Vec<(&str, SuzakuColor)>) {
+    // Each column is a share of its own total: this level's detections out of all detections,
+    // and this level's unique rules out of all unique rules that fired. The old denominator for
+    // both was the event count, which made the "Unique" share (a handful of rules over millions
+    // of events) round to 0% for every level.
+    let (total_detections, total_uniq) = detection_totals(sum);
     for (level, color) in levels {
         if let Some(hits) = sum.level_with_hits.get(*level) {
             let uniq_hits = hits.keys().len();
@@ -97,13 +116,13 @@ fn print_summary_levels(sum: &DetectionSummary, levels: &Vec<(&str, SuzakuColor)
                 "Total | Unique {} detections: {} ({:.2}%) | {} ({:.2}%)",
                 level,
                 total_hits.to_formatted_string(&Locale::en),
-                total_hits * 100 / sum.event_with_hits,
-                uniq_hits,
-                uniq_hits * 100 / sum.event_with_hits
+                percentage(total_hits, total_detections),
+                uniq_hits.to_formatted_string(&Locale::en),
+                percentage(uniq_hits, total_uniq)
             );
             p(color.rdg(false), &msg, true);
         } else {
-            let msg = format!("Total | Unique {level} detections: 0 (0%) | 0 (0%)");
+            let msg = format!("Total | Unique {level} detections: 0 (0.00%) | 0 (0.00%)");
             p(color.rdg(false), &msg, true);
         }
     }
@@ -297,10 +316,40 @@ mod tests {
     }
 
     #[test]
+    fn percentage_keeps_fractions_below_one_percent() {
+        // The integer division this replaced truncated 0.51% to 0, and `{:.2}` on an integer
+        // prints `0`, not `0.00` — so every sub-1% level was reported as "(0%)".
+        assert!((percentage(11_807, 2_332_963) - 0.506_0).abs() < 0.001);
+        assert_eq!(format!("{:.2}", percentage(11_807, 2_332_963)), "0.51");
+        assert_eq!(percentage(1, 4), 25.0);
+        // Empty denominator: no 0/0 NaN.
+        assert_eq!(percentage(0, 0), 0.0);
+    }
+
+    #[test]
+    fn detection_totals_sum_over_all_levels() {
+        let mut sum = DetectionSummary::default();
+        sum.level_with_hits.insert(
+            "critical".to_string(),
+            HashMap::from([("rule a".to_string(), 10usize)]),
+        );
+        sum.level_with_hits.insert(
+            "low".to_string(),
+            HashMap::from([("rule b".to_string(), 20usize), ("rule c".to_string(), 70)]),
+        );
+        // 3 unique rules firing 100 times in total; the unique share is per unique rule, so
+        // critical is 1/3 rather than the ~0% the event-count denominator produced.
+        assert_eq!(detection_totals(&sum), (100, 3));
+        assert_eq!(percentage(10, 100), 10.0);
+        assert!((percentage(1, 3) - 33.333).abs() < 0.01);
+    }
+
+    #[test]
     fn data_reduction_handles_double_count_and_empty() {
         // Normal case.
         assert_eq!(data_reduction(100, 5), (95, 95.0));
-        // event_with_hits > total_events (correlation double-count): no underflow.
+        // event_with_hits > total_events must not underflow. The correlation double-count
+        // that produced this is fixed, so the guard is defence in depth.
         assert_eq!(data_reduction(1, 2), (0, 0.0));
         // Empty dataset: no 0/0 NaN.
         let (n, pct) = data_reduction(0, 0);
