@@ -1,10 +1,14 @@
 # 変更点
 
-## 2.0.1 [未リリース]
+## 2.0.1 [2026/08/24] - El Niño Release
 
 **バグ修正:**
 
 - イベントのタイムスタンプ取得時に、出力プロファイルのフィールド指定をそのまま `Event::get` に渡していた問題を修正した。プロファイルの指定は先頭にドットが付き `|` 区切りのフォールバックリストにもなる（`.eventTime`、`.time|.eventTimestamp|.CreationTime`）一方、`Event::get` はドットなしのフィールド名を受け取るため、常に `None` が返っていた。この影響で、サマリーの `Dates with most total detections` が `n/a` となり、`first_event_time`/`last_event_time` が設定されず、さらに **Sigma の相関（correlation）ルールが一切発火しなかった**（同梱の相関ルール5本がすべて無効）。該当する3箇所すべてで、`Timestamp` カラムと同じ「存在する最初の候補を採用する」ルールの共通ヘルパー経由で解決するようにし、表示値と分析値が食い違わないようにした。 (#191) (@fukusuket)
+
+**その他:**
+
+- リリースに向けて`Cargo.lock`を更新した。宣言されているMSRV（`rust-version = "1.97.1"`）と互換性のある最新バージョンへ59パッケージを更新した。主なものは`arrow`/`parquet` 59.1 → 59.2、`clap` 4.6.5 → 4.6.6、`maxminddb` 0.30.0 → 0.30.3、`duckdb` 1.10504 → 1.10505、`libgit2-sys` 1.9.6 → 1.9.7、および`regex`・`serde_json`・`tempfile`・`rayon`・`icu_*`系である。`Cargo.toml`のバージョン指定は一切変更していないため、すべての更新は#189で設定した下限の範囲内に収まっている。なお`comfy-table` 8.0.0への更新は意図的に見送った。テーブルAPIが再設計されており（`modifiers`モジュールと`load_preset`が削除され、`TableStyle`の構造も変更）、Suzakuが描画するすべてのテーブルに手を入れるコード移行が必要になるため、パッチリリースに含めるべき変更ではないと判断した。 (@YamatoSecurity)
 
 ## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 

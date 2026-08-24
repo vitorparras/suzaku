@@ -5,8 +5,8 @@
 **Suzaku** is a cloud log threat detection and fast forensics tool developed by Yamato Security, designed for AWS CloudTrail and Azure logs.  
 It analyzes logs using the Sigma rule engine (`sigma-rust`) and outputs timelines in CSV/JSON/JSONL format.
 
-- **Language**: Rust (edition = "2024", rust-version = "1.89.0")
-- **Version**: `2.0.0-dev`
+- **Language**: Rust (edition = "2024", rust-version = "1.97.1")
+- **Version**: `2.0.1`
 - **Memory Allocator**: `mimalloc` (configured as global allocator)
 - **Parallelism**: `rayon`
 
