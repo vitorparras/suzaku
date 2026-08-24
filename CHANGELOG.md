@@ -1,10 +1,14 @@
 # Changes
 
-## 2.0.1 [Unreleased]
+## 2.0.1 [2026/08/24] - El Niño Release
 
 **Bug Fixes:**
 
 - Event timestamps were looked up by passing the output profile's field spec to `Event::get` verbatim, but those specs are dot-prefixed and may be `|`-separated fallback lists (`.eventTime`, `.time|.eventTimestamp|.CreationTime`) while `Event::get` expects a bare field name, so every lookup returned `None`. As a result the summary's `Dates with most total detections` printed `n/a`, `first_event_time`/`last_event_time` were never set, and **Sigma correlation rules never fired at all** (all five shipped rules were dead). All three call sites now resolve the field through one shared helper using the same "first candidate present wins" rule as the `Timestamp` column, so displayed and analysed timestamps always agree.  (#191) (@fukusuket)
+
+**Other:**
+
+- Refreshed `Cargo.lock` for the release: 59 packages moved to their latest versions compatible with the declared MSRV (`rust-version = "1.97.1"`), including `arrow`/`parquet` 59.1 → 59.2, `clap` 4.6.5 → 4.6.6, `maxminddb` 0.30.0 → 0.30.3, `duckdb` 1.10504 → 1.10505, `libgit2-sys` 1.9.6 → 1.9.7 and `regex`, `serde_json`, `tempfile`, `rayon` and the `icu_*` family. No declared version requirement in `Cargo.toml` changed, so every update is within the floors set in #189. `comfy-table` 8.0.0 was left alone deliberately: it reworks the table API (the `modifiers` module and `load_preset` are gone, `TableStyle` changed shape), which is a code migration touching every table Suzaku renders rather than a version bump, and does not belong in a patch release. (@YamatoSecurity)
 
 ## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
