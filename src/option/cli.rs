@@ -51,7 +51,7 @@ pub enum OutputFormat {
 
 #[derive(Parser)]
 #[command(name = "suzaku")]
-#[command(version = VERSION)]
+#[command(version = FULL_VERSION)]
 #[command(author = "Yamato Security (https://github.com/Yamato-Security/suzaku - @SecurityYamato)")]
 #[command(about = "Cloud Log Threat Detection and Fast Forensics")]
 pub struct Cli {
