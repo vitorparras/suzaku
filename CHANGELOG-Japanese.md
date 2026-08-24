@@ -1,5 +1,11 @@
 # 変更点
 
+## 2.0.1 [未リリース]
+
+**バグ修正:**
+
+- イベントのタイムスタンプ取得時に、出力プロファイルのフィールド指定をそのまま `Event::get` に渡していた問題を修正した。プロファイルの指定は先頭にドットが付き `|` 区切りのフォールバックリストにもなる（`.eventTime`、`.time|.eventTimestamp|.CreationTime`）一方、`Event::get` はドットなしのフィールド名を受け取るため、常に `None` が返っていた。この影響で、サマリーの `Dates with most total detections` が `n/a` となり、`first_event_time`/`last_event_time` が設定されず、さらに **Sigma の相関（correlation）ルールが一切発火しなかった**（同梱の相関ルール5本がすべて無効）。該当する3箇所すべてで、`Timestamp` カラムと同じ「存在する最初の候補を採用する」ルールの共通ヘルパー経由で解決するようにし、表示値と分析値が食い違わないようにした。 (#191) (@fukusuket)
+
 ## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
 **新機能:**

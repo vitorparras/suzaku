@@ -51,4 +51,4 @@ jobs:
         run: cd main && cargo run --release -- aws-ct-timeline -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q
 
       - name: aws-ct-timeline(-o)
-        run: cd main && cargo run --release -- aws-ct-timeline -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q  -t csv,json,jsonl,duckdb -C
+        run: cd main && cargo run --release -- aws-ct-timeline -d ../suzaku-sample-data/SANS-504-S3-ransomware-lab -q -o timeline -t csv,json,jsonl,duckdb -C

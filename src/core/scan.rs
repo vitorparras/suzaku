@@ -2,12 +2,12 @@ use crate::core::color::SuzakuColor::{Green, Orange};
 use crate::core::errorlog::{log_error, log_warn};
 use crate::core::log_source::{LogSource, is_match_service};
 use crate::core::summary::DetectionSummary;
-use crate::core::timeline_writer::{OutputContext, write_record};
+use crate::core::timeline_writer::{OutputContext, event_timestamp, write_record};
 use crate::core::util::p;
 use crate::option::cli::{FileDateOption, TimeOption, TimelineOptions};
 use crate::option::timefiler::{filter_by_time, filter_file_by_date_path};
 use bytesize::ByteSize;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::NaiveDateTime;
 use colored::Colorize;
 use console::style;
 use flate2::read::GzDecoder;
@@ -495,11 +495,26 @@ fn detect_events<'a>(
             })
             .collect();
 
+        // process correlation base rules
+        // Kept aligned with `json_events` (one entry per event) so the hit statistics below can
+        // tell whether an event matched a base rule; flattened into `matched_correlation` after.
+        let base_rule_matched: Vec<Vec<TimestampedEvent>> =
+            process_correlation_base_rule(engine, &json_events, context);
+
         // perform post-processing
         // calculate some statistics values
+        // An event counts once, here in the scan pass, which is the only place every event is
+        // visited exactly once. It is "with hits" if any detection rule or any correlation base
+        // rule matched it. The correlation pass used to add to this counter as well, once per
+        // event per firing correlation result, so an event in several results (or already
+        // counted here) was counted several times and `event_with_hits` could exceed
+        // `total_events`, which pinned the reported data reduction at 0 events (0.00%).
         summary.event_with_hits += results
             .iter()
-            .filter(|(_, _, matched_rules)| !matched_rules.is_empty())
+            .zip(base_rule_matched.iter())
+            .filter(|((_, _, matched_rules), base_matched)| {
+                !matched_rules.is_empty() || !base_matched.is_empty()
+            })
             .count();
         summary.total_events += json_events.len();
 
@@ -512,37 +527,37 @@ fn detect_events<'a>(
             }
         }
 
-        // process correlation base rules
-        let base_rule_matched: Vec<TimestampedEvent> =
-            process_correlation_base_rule(engine, json_events, context);
-        matched_correlation.extend(base_rule_matched);
+        matched_correlation.extend(base_rule_matched.into_iter().flatten());
     }
 }
 
+/// Match every event against the correlation base rules, returning one `Vec` per event (in the
+/// order of `json_events`) holding the events it produced — empty when no base rule matched.
+/// The per-event grouping is what lets the caller count an event as "with hits" exactly once.
 fn process_correlation_base_rule<'a>(
     engine: &'a CorrelationEngine,
-    json_events: Vec<(&Value, Event)>,
+    json_events: &[(&Value, Event)],
     context: &mut OutputContext,
-) -> Vec<TimestampedEvent<'a>> {
+) -> Vec<Vec<TimestampedEvent<'a>>> {
     json_events
         .par_iter()
-        .flat_map(|(_, event)| {
+        .map(|(_, event)| {
             engine
                 .base_rules
                 .values()
                 .filter_map(|rule| {
+                    // The timestamp must resolve through the profile's field spec: it is
+                    // `.eventTime` for AWS and a `|`-separated list for Azure/M365, and neither
+                    // form is a bare key `Event::get` would accept. An event whose time cannot be
+                    // read cannot be placed in a correlation window, so it is dropped here.
                     if rule.is_match(event)
-                        && let Some(timestamp_field) = event.get(context.prof_ts_key)
+                        && let Some(timestamp) = event_timestamp(context.prof_ts_key, event)
                     {
-                        let ts = timestamp_field.value_to_string();
-                        if let Ok(parsed_time) = DateTime::parse_from_rfc3339(&ts) {
-                            let utc_time = parsed_time.with_timezone(&Utc);
-                            return Some(TimestampedEvent {
-                                event: event.clone(),
-                                timestamp: utc_time,
-                                rule,
-                            });
-                        }
+                        return Some(TimestampedEvent {
+                            event: event.clone(),
+                            timestamp,
+                            rule,
+                        });
                     }
                     None
                 })
@@ -579,31 +594,27 @@ pub fn append_summary_data(
                 .or_insert(1);
         }
     }
-    if let Some(event_time) = event.get(context.prof_ts_key) {
-        let event_time_str = event_time.value_to_string();
-        if let Ok(event_time) = event_time_str.parse::<DateTime<Utc>>() {
-            let unix_time = event_time.timestamp();
-            summary.timestamps.push(unix_time);
-            if summary.first_event_time.is_none() || event_time < summary.first_event_time.unwrap()
-            {
-                summary.first_event_time = Some(event_time);
-            }
-            if summary.last_event_time.is_none() || event_time > summary.last_event_time.unwrap() {
-                summary.last_event_time = Some(event_time);
-            }
-            if let Some(level) = &rule.level
-                && generate
-            {
-                let level = format!("{level:?}").to_lowercase();
-                let date = event_time.date_naive().format("%Y-%m-%d").to_string();
-                summary
-                    .dates_with_hits
-                    .entry(level)
-                    .or_default()
-                    .entry(date)
-                    .and_modify(|e| *e += 1)
-                    .or_insert(1);
-            }
+    if let Some(event_time) = event_timestamp(context.prof_ts_key, event) {
+        let unix_time = event_time.timestamp();
+        summary.timestamps.push(unix_time);
+        if summary.first_event_time.is_none() || event_time < summary.first_event_time.unwrap() {
+            summary.first_event_time = Some(event_time);
+        }
+        if summary.last_event_time.is_none() || event_time > summary.last_event_time.unwrap() {
+            summary.last_event_time = Some(event_time);
+        }
+        if let Some(level) = &rule.level
+            && generate
+        {
+            let level = format!("{level:?}").to_lowercase();
+            let date = event_time.date_naive().format("%Y-%m-%d").to_string();
+            summary
+                .dates_with_hits
+                .entry(level)
+                .or_default()
+                .entry(date)
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
         }
     }
 }
@@ -857,6 +868,66 @@ pub fn get_content(f: &PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The summary's date breakdown and its first/last event times are derived from the event
+    // field the output profile NAMES -- `.eventTime` for AWS, `.time|.eventTimestamp|
+    // .CreationTime` for Azure/M365. That spec is dot-prefixed and may be a fallback list, so
+    // handing it to `Event::get` verbatim resolved nothing for any event: a run with hundreds of
+    // detections still printed "n/a" for every level under "Dates with most total detections".
+    // Verified by mutation: restoring `event.get(context.prof_ts_key)` fails this test for both
+    // log sources.
+    #[test]
+    fn append_summary_data_records_event_times_from_the_shipped_profiles() {
+        use crate::core::log_source::LogSource;
+        use crate::core::timeline_writer::{OutputConfig, Writers};
+        use crate::core::util::load_profile;
+        use chrono::{TimeZone, Utc};
+        use sigma_rust::{event_from_json, rule_from_yaml};
+
+        let rule = rule_from_yaml(
+            "title: t\nlogsource:\n    category: test\ndetection:\n    selection:\n        eventName: E\n    condition: selection\nlevel: medium\n",
+        )
+        .unwrap();
+        let expected = Utc.with_ymd_and_hms(2023, 7, 10, 12, 27, 45).unwrap();
+
+        for (name, log, event_json) in [
+            (
+                "aws",
+                LogSource::Aws,
+                r#"{"eventTime": "2023-07-10T12:27:45Z", "eventName": "E"}"#,
+            ),
+            (
+                "azure",
+                LogSource::Azure,
+                r#"{"time": "2023-07-10T12:27:45Z", "eventName": "E"}"#,
+            ),
+        ] {
+            let mut geo = None;
+            let profile = load_profile(&log, &geo, true);
+            let config = OutputConfig::new(true, false, false);
+            let mut context = OutputContext::new(&profile, &mut geo, &config, Writers::new(), &[]);
+            let mut summary = DetectionSummary::default();
+            let event = event_from_json(event_json).unwrap();
+
+            append_summary_data(&mut summary, &event, &rule, true, &mut context);
+
+            assert_eq!(
+                summary.first_event_time,
+                Some(expected),
+                "{name}: the event time must be read through the profile's Timestamp spec"
+            );
+            assert_eq!(summary.last_event_time, Some(expected), "{name}");
+            assert_eq!(summary.timestamps, vec![expected.timestamp()], "{name}");
+            assert_eq!(
+                summary
+                    .dates_with_hits
+                    .get("medium")
+                    .and_then(|d| d.get("2023-07-10")),
+                Some(&1),
+                "{name}: the date breakdown must not be empty"
+            );
+        }
+    }
 
     #[test]
     fn test_load_parquet_events_athena_style() {

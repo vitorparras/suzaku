@@ -1,5 +1,11 @@
 # Changes
 
+## 2.0.1 [Unreleased]
+
+**Bug Fixes:**
+
+- Event timestamps were looked up by passing the output profile's field spec to `Event::get` verbatim, but those specs are dot-prefixed and may be `|`-separated fallback lists (`.eventTime`, `.time|.eventTimestamp|.CreationTime`) while `Event::get` expects a bare field name, so every lookup returned `None`. As a result the summary's `Dates with most total detections` printed `n/a`, `first_event_time`/`last_event_time` were never set, and **Sigma correlation rules never fired at all** (all five shipped rules were dead). All three call sites now resolve the field through one shared helper using the same "first candidate present wins" rule as the `Timestamp` column, so displayed and analysed timestamps always agree.  (#191) (@fukusuket)
+
 ## 2.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
 **New Features:**
